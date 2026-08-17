@@ -1,0 +1,30 @@
+services:
+  tennis:
+    build: .
+    container_name: kalshi-tennis
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      BOT_STRATEGY: ${BOT_STRATEGY:-tennis}
+      BOT_LIVE: ${BOT_LIVE:-true}
+      BOT_LOOP: ${BOT_LOOP:-true}
+      BOT_INTERVAL: ${BOT_INTERVAL:-30}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      # Project root as a separate path so the entrypoint can find either
+      # kalshi_private_key.pem or kalshi_private_key. Binding a missing *file*
+      # on Docker Desktop for Windows creates a directory instead.
+      - type: bind
+        source: .
+        target: /host-project
+        read_only: true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
