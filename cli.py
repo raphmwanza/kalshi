@@ -342,10 +342,12 @@ def cmd_tennis_report(args: argparse.Namespace) -> None:
 
 
 def cmd_tennis_dashboard(args: argparse.Namespace) -> None:
-    """Serve the tennis journal dashboard on localhost."""
-    from src.journal.dashboard import serve_dashboard
+    """Serve the read-only tennis journal. Listens on $PORT when BOT_MODE=dashboard."""
+    from src.journal.web import main
 
-    serve_dashboard(host=args.host, port=args.port)
+    os.environ["DASHBOARD_HOST"] = args.host
+    os.environ["PORT"] = str(args.port)
+    main()
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:

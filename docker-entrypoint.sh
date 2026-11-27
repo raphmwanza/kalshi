@@ -13,6 +13,13 @@ live_on() {
     [ "$v" = "1" ] || [ "$v" = "true" ] || [ "$v" = "yes" ] || [ "$v" = "on" ]
 }
 
+# Read-only journal dashboard. No Kalshi key is required. Railway sets PORT.
+mode=$(printf '%s' "${BOT_MODE:-trade}" | tr '[:upper:]' '[:lower:]')
+if [ "$mode" = "dashboard" ] || [ "${1:-}" = "dashboard" ]; then
+    echo "Starting read-only trade dashboard on port ${PORT:-8080}"
+    exec python -m src.journal.web
+fi
+
 # Drop directory stubs Docker Desktop creates when a file bind-mount is missing.
 for f in /app/kalshi_private_key.pem /app/kalshi_private_key; do
     if [ -d "$f" ]; then

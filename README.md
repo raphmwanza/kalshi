@@ -131,10 +131,26 @@ Every entry decision, order, stop, take-profit, and settlement is appended to a 
 ```bash
 python cli.py tennis-report                  # win rate, avg entry, PnL by rule, implied edge
 python cli.py tennis-report --account main
-python cli.py tennis-dashboard               # http://127.0.0.1:8765  (local only)
+DASHBOARD_PASSWORD=choose-one python cli.py tennis-dashboard
 ```
 
-The settled edge is the realized win rate on contracts held to settlement minus their average entry price. Positive means those entries won more often than the price implied. The dashboard is a localhost page; the Railway process is still a worker and does not listen on a port.
+The settled edge is the realized win rate on contracts held to settlement minus the average entry price. Positive means those entries won more often than the price implied.
+
+### Dashboard service on Railway
+
+Add a second service in the same Railway project from this repo. Leave the trading service as a worker (`BOT_MODE` unset). On the new service:
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `BOT_MODE` | yes | `dashboard`. The image entrypoint then runs `python -m src.journal.web` and does not look for a Kalshi key |
+| `DATABASE_URL` | yes | The same Postgres URL the worker writes. Add it as a variable reference to the Postgres plugin |
+| `DASHBOARD_PASSWORD` | yes | Password for HTTP basic auth. The page refuses to serve journal data when this is empty |
+| `DASHBOARD_USER` | no | Basic-auth username. Default `dashboard` |
+| `PORT` | automatic | Railway sets this. The server binds `0.0.0.0:$PORT` |
+
+Give that service a public domain. Optional health check path: `/healthz` (no journal data, no password). Do not set `BOT_MODE=dashboard` on the trading service.
+
+If the service start command replaces the image entrypoint entirely, set it to `python -m src.journal.web`. If Railway passes the start command through the entrypoint, `dashboard` is enough. The page is read-only: open positions, recent decisions and trades, win rate, cumulative PnL (Chart.js), PnL by entry rule, and the last cycle time for each account. There are no trading controls.
 
 Semifinals and finals are not entered (SofaScore `cupRoundType` 1 or 2, or a round label of semifinal/final). Quarterfinals still qualify. A tournament named "ATP Finals" is not treated as the final round.
 

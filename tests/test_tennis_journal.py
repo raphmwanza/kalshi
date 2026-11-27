@@ -75,6 +75,9 @@ def test_summary_win_rate_pnl_and_implied_edge():
     assert summary["avg_implied_prob"] == pytest.approx(0.575)
     assert summary["implied_edge"] == pytest.approx(0.5 - 0.575)
     assert summary["decisions"]["skip"] == 1
+    assert summary["accounts"]["main"]["win_rate"] == 0.5
+    assert summary["accounts"]["main"]["pnl_series"][-1]["cumulative"] == pytest.approx(summary["total_pnl"])
+    assert summary["accounts"]["main"]["open_positions"] == 0
     page = render_dashboard(summary, events)
     assert "Settled edge" in page
     assert "set3_favorite" in page
@@ -269,3 +272,48 @@ async def test_strategy_logs_entries_and_skips_semifinals(tmp_path):
     assert skipped["skipped_late_round"] == 2
     assert client.placed == []
     await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_is_read_only_and_password_protected(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from src.journal.web import create_app
+
+    async def load_events():
+        return [
+            {
+                "id": 1, "ts": "2026-01-01T00:00:00+00:00", "account": "main",
+                "kind": "cycle", "order_status": "ok", "details": "placed=1 errors=0",
+            },
+            {
+                "id": 2, "ts": "2026-01-01T00:00:01+00:00", "account": "main",
+                "kind": "order", "order_action": "buy", "order_status": "executed",
+                "ticker": "A", "rule": "set3_favorite", "player": "Alcaraz",
+                "price": 0.8, "implied_prob": 0.8, "fill_count": 1, "fees": 0.02,
+            },
+            {
+                "id": 3, "ts": "2026-01-02T00:00:00+00:00", "account": "main",
+                "kind": "signal", "decision": "enter", "rule": "set3_favorite",
+                "ticker": "A", "player": "Alcaraz", "score": "6-4",
+            },
+        ]
+
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    client = TestClient(create_app(load_events))
+    assert client.get("/healthz").status_code == 200
+    assert client.get("/healthz").json() == {"ok": True}
+    assert client.get("/").status_code == 503
+
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "s3cret")
+    assert client.get("/").status_code == 401
+    assert client.get("/", auth=("dashboard", "nope")).status_code == 401
+    page = client.get("/", auth=("dashboard", "s3cret"))
+    assert page.status_code == 200
+    body = page.text
+    assert "Read-only" in body
+    assert "<form" not in body.lower()
+    assert "set3_favorite" in body
+    assert "Last cycle" in body
+    assert "chart.js" in body.lower()
+    assert client.post("/orders", auth=("dashboard", "s3cret")).status_code == 405

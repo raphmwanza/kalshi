@@ -8,6 +8,7 @@ account is logged and the others still run.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from src.clients.accounts import KalshiAccount
@@ -89,4 +90,36 @@ async def run_tennis_accounts(
                     await client.close()
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Closing account %s failed: %s", account.name, exc)
+            await _record_cycle(journal, account.name, combined["by_account"].get(account.name))
     return combined
+
+
+async def _record_cycle(journal, account_name: str, stats: Optional[dict]) -> None:
+    """Append a heartbeat the read-only dashboard can show as last cycle time."""
+    if journal is None:
+        return
+    stats = stats or {}
+    if stats.get("error"):
+        status = "error"
+    elif stats.get("needs_backoff"):
+        status = "backoff"
+    else:
+        status = "ok"
+    detail = str(stats.get("error") or "")
+    if not detail:
+        detail = (
+            f"placed={int(stats.get('placed') or 0)} "
+            f"errors={int(stats.get('errors') or 0)}"
+        )
+    ts = datetime.now(timezone.utc).isoformat()
+    try:
+        await journal.record({
+            "ts": ts,
+            "account": account_name,
+            "kind": "cycle",
+            "order_status": status,
+            "details": detail[:500],
+            "dedupe_key": f"cycle:{account_name}:{ts}",
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not record cycle heartbeat for %s: %s", account_name, exc)

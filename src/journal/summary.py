@@ -43,6 +43,123 @@ def _as_bool(value) -> Optional[bool]:
     return None
 
 
+def _pnl_series(rows: List[dict]) -> List[dict]:
+    ordered = sorted(rows, key=lambda row: str(row.get("closed_at") or ""))
+    cumulative = 0.0
+    series = []
+    for row in ordered:
+        cumulative += row["pnl"]
+        series.append({
+            "ts": row.get("closed_at") or "",
+            "pnl": row["pnl"],
+            "cumulative": cumulative,
+            "ticker": row.get("ticker") or "",
+        })
+    return series
+
+
+def _last_cycles(events: List[dict]) -> Dict[str, dict]:
+    found: Dict[str, dict] = {}
+    for event in events:
+        if (event.get("kind") or "").lower() != "cycle":
+            continue
+        account = event.get("account") or ""
+        found[account] = {
+            "ts": event.get("ts") or "",
+            "status": event.get("order_status") or "ok",
+            "details": event.get("details") or "",
+        }
+    return found
+
+
+def _rule_table(closed: List[dict]) -> Dict[str, dict]:
+    def _rate(rows: List[dict]) -> Optional[float]:
+        if not rows:
+            return None
+        return sum(1 for row in rows if row["won"]) / len(rows)
+
+    def _avg(values: List[float]) -> Optional[float]:
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    grouped: Dict[str, List[dict]] = {}
+    for row in closed:
+        grouped.setdefault(row["rule"], []).append(row)
+    table = {}
+    for rule, rows in sorted(grouped.items()):
+        resolved = [row for row in rows if row["resolved"]]
+        implied = _avg([row["implied"] for row in resolved])
+        realized = _rate(resolved)
+        table[rule] = {
+            "closed": len(rows),
+            "wins": sum(1 for row in rows if row["won"]),
+            "losses": sum(1 for row in rows if not row["won"]),
+            "win_rate": _rate(rows),
+            "avg_entry_price": _avg([row["entry_price"] for row in rows]),
+            "pnl": sum(row["pnl"] for row in rows),
+            "settled": len(resolved),
+            "avg_implied_prob": implied,
+            "settled_win_rate": realized,
+            "implied_edge": None if implied is None or realized is None else realized - implied,
+        }
+    return table
+
+
+def _pack(
+    closed: List[dict],
+    still_open: List[dict],
+    decisions: Dict[str, int],
+    last_cycle: Optional[dict],
+) -> Dict:
+    def _rate(rows: List[dict]) -> Optional[float]:
+        if not rows:
+            return None
+        return sum(1 for row in rows if row["won"]) / len(rows)
+
+    def _avg(values: List[float]) -> Optional[float]:
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    resolved = [row for row in closed if row["resolved"]]
+    avg_implied = _avg([row["implied"] for row in resolved])
+    settled_rate = _rate(resolved)
+    return {
+        "entries": len(still_open) + len(closed),
+        "open_positions": len(still_open),
+        "open": [
+            {
+                "ticker": lot["ticker"],
+                "player": lot.get("player") or "",
+                "rule": lot["rule"],
+                "size": lot["remaining"],
+                "entry_price": lot["entry_price"],
+                "opened_at": lot.get("opened_at") or "",
+            }
+            for lot in still_open
+        ],
+        "closed": len(closed),
+        "wins": sum(1 for row in closed if row["won"]),
+        "losses": sum(1 for row in closed if not row["won"]),
+        "win_rate": _rate(closed),
+        "avg_entry_price": _avg(
+            [row["entry_price"] for row in closed] or [lot["entry_price"] for lot in still_open]
+        ),
+        "total_pnl": sum(row["pnl"] for row in closed),
+        "decisions": decisions,
+        "by_rule": _rule_table(closed),
+        "avg_implied_prob": avg_implied,
+        "settled_win_rate": settled_rate,
+        "implied_edge": (
+            None if avg_implied is None or settled_rate is None else settled_rate - avg_implied
+        ),
+        "settled": len(resolved),
+        "pnl_series": _pnl_series(closed),
+        "last_cycle": last_cycle,
+    }
+
+
 def summarize_events(events: List[dict]) -> Dict:
     """Summarize append-only journal rows. Unknown kinds are ignored."""
     ordered = sorted(
@@ -78,12 +195,17 @@ def summarize_events(events: List[dict]) -> Dict:
                 "account": event.get("account") or "",
                 "ticker": event.get("ticker") or "",
                 "rule": event.get("rule") or "unknown",
+                "player": event.get("player") or "",
+                "match_label": event.get("match_label") or "",
+                "opened_at": event.get("ts") or "",
                 "entry_price": price,
                 "implied": price if implied is None else implied,
                 "size": filled,
                 "remaining": filled,
                 "fees": _as_float(event.get("fees")) or 0.0,
             })
+            continue
+        if kind == "cycle":
             continue
         if kind not in {"exit", "settlement"}:
             continue
@@ -116,71 +238,44 @@ def summarize_events(events: List[dict]) -> Dict:
             "account": account,
             "ticker": ticker,
             "rule": lot["rule"],
+            "player": lot.get("player") or "",
             "pnl": pnl,
             "won": won,
             "resolved": resolved,
             "entry_price": entry,
             "implied": lot["implied"],
             "size": close_size,
+            "closed_at": event.get("ts") or "",
         })
 
-    def _rate(rows: List[dict]) -> Optional[float]:
-        if not rows:
-            return None
-        return sum(1 for row in rows if row["won"]) / len(rows)
-
-    def _avg(values: List[float]) -> Optional[float]:
-        if not values:
-            return None
-        return sum(values) / len(values)
-
-    by_rule: Dict[str, dict] = {}
-    for row in closed:
-        bucket = by_rule.setdefault(row["rule"], [])
-        bucket.append(row)
-    rule_summary = {}
-    for rule, rows in sorted(by_rule.items()):
-        resolved = [row for row in rows if row["resolved"]]
-        implied = _avg([row["implied"] for row in resolved])
-        realized = _rate(resolved)
-        edge = None if implied is None or realized is None else realized - implied
-        rule_summary[rule] = {
-            "closed": len(rows),
-            "wins": sum(1 for row in rows if row["won"]),
-            "losses": sum(1 for row in rows if not row["won"]),
-            "win_rate": _rate(rows),
-            "avg_entry_price": _avg([row["entry_price"] for row in rows]),
-            "pnl": sum(row["pnl"] for row in rows),
-            "settled": len(resolved),
-            "avg_implied_prob": implied,
-            "settled_win_rate": realized,
-            "implied_edge": edge,
-        }
-
-    resolved_all = [row for row in closed if row["resolved"]]
-    avg_implied = _avg([row["implied"] for row in resolved_all])
-    settled_rate = _rate(resolved_all)
-    open_count = sum(1 for lot in open_lots if lot["remaining"] > 0)
-    return {
-        "entries": sum(lot["size"] > 0 for lot in open_lots),
-        "open_positions": open_count,
-        "closed": len(closed),
-        "wins": sum(1 for row in closed if row["won"]),
-        "losses": sum(1 for row in closed if not row["won"]),
-        "win_rate": _rate(closed),
-        "avg_entry_price": _avg([row["entry_price"] for row in closed] or [
-            lot["entry_price"] for lot in open_lots
-        ]),
-        "total_pnl": sum(row["pnl"] for row in closed),
-        "decisions": decisions,
-        "by_rule": rule_summary,
-        "avg_implied_prob": avg_implied,
-        "settled_win_rate": settled_rate,
-        "implied_edge": (
-            None if avg_implied is None or settled_rate is None else settled_rate - avg_implied
-        ),
-        "settled": len(resolved_all),
-    }
+    still_open = [lot for lot in open_lots if lot["remaining"] > 0]
+    cycles = _last_cycles(ordered)
+    packed = _pack(closed, still_open, decisions, cycles.get(""))
+    names = sorted({
+        *(row.get("account") or "" for row in ordered if row.get("account")),
+        *(lot["account"] for lot in still_open),
+    })
+    accounts = {}
+    for name in names:
+        account_closed = [row for row in closed if row["account"] == name]
+        account_open = [lot for lot in still_open if lot["account"] == name]
+        account_decisions = {"enter": 0, "skip": 0}
+        for event in ordered:
+            if (event.get("account") or "") != name:
+                continue
+            if (event.get("kind") or "").lower() != "signal":
+                continue
+            decision = (event.get("decision") or "").lower()
+            if decision in account_decisions:
+                account_decisions[decision] += 1
+        accounts[name] = _pack(
+            account_closed, account_open, account_decisions, cycles.get(name)
+        )
+    packed["accounts"] = accounts
+    packed["open_positions"] = len(still_open)
+    if cycles:
+        packed["last_cycle"] = max(cycles.values(), key=lambda item: item.get("ts") or "")
+    return packed
 
 
 def _pct(value: Optional[float]) -> str:
