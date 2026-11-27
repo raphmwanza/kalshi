@@ -45,7 +45,9 @@ logger = logging.getLogger(__name__)
 def _nostore(response):
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    # no-referrer makes Chrome send Origin: null on this form POST, which the
+    # login check then rejects. same-origin still omits the URL on other sites.
+    response.headers["Referrer-Policy"] = "same-origin"
     response.headers["X-Frame-Options"] = "DENY"
     return response
 

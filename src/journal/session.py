@@ -178,6 +178,13 @@ def origin_ok(request: Request) -> bool:
     origin = (request.headers.get("origin") or "").strip()
     if not origin:
         return True
+    # Chrome sends the literal header "null" when a referrer policy strips the
+    # origin. Treat that as missing only for a same-origin fetch (or when the
+    # browser did not send Sec-Fetch-Site). The CSRF token and the
+    # SameSite=Strict cookie still have to match.
+    fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+    if origin.lower() == "null" and fetch_site in {"", "same-origin"}:
+        return True
     host = request.headers.get("host") or ""
     forwarded_host_raw = request.headers.get("x-forwarded-host") or ""
     forwarded_host = _first_header_value(forwarded_host_raw)

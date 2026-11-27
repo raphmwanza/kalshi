@@ -478,6 +478,61 @@ def test_login_accepts_dashboard_public_url(monkeypatch, dashboard_env):
     assert response.status_code == 303
 
 
+def test_null_origin_login_requires_same_origin_fetch_and_csrf(monkeypatch, dashboard_env):
+    """Production sends Origin: null. Same-origin fetches may log in; cross-site may not."""
+    from fastapi.testclient import TestClient
+
+    from src.journal.web import create_app
+
+    async def load_events():
+        return []
+
+    client = TestClient(create_app(load_events))
+    login = client.get("/login")
+    assert login.headers["referrer-policy"] == "same-origin"
+    token = _csrf(login.text)
+    ok = client.post(
+        "/login",
+        data={"password": "s3cret", "csrf_token": token},
+        headers={"origin": "null", "sec-fetch-site": "same-origin"},
+        follow_redirects=False,
+    )
+    assert ok.status_code == 303
+    assert "samesite=strict" in ok.headers["set-cookie"].lower()
+
+    client.cookies.clear()
+    login = client.get("/login")
+    token = _csrf(login.text)
+    missing_site = client.post(
+        "/login",
+        data={"password": "s3cret", "csrf_token": token},
+        headers={"origin": "null"},
+        follow_redirects=False,
+    )
+    assert missing_site.status_code == 303
+
+    client.cookies.clear()
+    login = client.get("/login")
+    token = _csrf(login.text)
+    no_csrf = client.post(
+        "/login",
+        data={"password": "s3cret"},
+        headers={"origin": "null", "sec-fetch-site": "same-origin"},
+    )
+    assert no_csrf.status_code == 403
+
+    client.cookies.clear()
+    login = client.get("/login")
+    token = _csrf(login.text)
+    cross = client.post(
+        "/login",
+        data={"password": "s3cret", "csrf_token": token},
+        headers={"origin": "null", "sec-fetch-site": "cross-site"},
+    )
+    assert cross.status_code == 403
+    assert "Cross-site request rejected." in cross.text
+
+
 def test_cross_site_login_is_rejected(monkeypatch, dashboard_env):
     from fastapi.testclient import TestClient
 
