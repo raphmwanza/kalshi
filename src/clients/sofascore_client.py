@@ -637,6 +637,13 @@ class SofaScoreClient:
         """
         self.last_fetch_blocked = False
         self.score_source = ""
+        flash_matches, flash_ok = await self._load_flashscore()
+        if flash_ok:
+            self.score_source = "flashscore"
+            line = f"scores: Flashscore ({len(flash_matches)} live)"
+            logger.info(line)
+            print(line, flush=True)
+            return flash_matches
         if sofascore_in_backoff():
             logger.info("SofaScore cooling down after a block; trying ESPN this cycle")
             matches, ok = [], False
@@ -653,15 +660,41 @@ class SofaScoreClient:
         if espn_ok:
             self.score_source = "espn"
             line = f"scores: ESPN ({len(espn_matches)} live)"
-            logger.warning("SofaScore unavailable; %s", line)
+            logger.warning("Flashscore and SofaScore unavailable; %s", line)
             print(line, flush=True)
             return espn_matches
         self.last_fetch_blocked = True
         logger.error(
-            "scores: none (SofaScore and ESPN both failed). No new entries this cycle."
+            "scores: none (Flashscore, SofaScore, and ESPN failed). No new entries this cycle."
         )
-        print("scores: none (SofaScore and ESPN both failed)", flush=True)
+        print("scores: none (Flashscore, SofaScore, and ESPN failed)", flush=True)
         return []
+
+    async def _load_flashscore(self) -> tuple:
+        from src.clients.flashscore_tennis import FLASHSCORE_URLS, flashscore_headers, matches_from_flashscore_feed
+
+        headers = flashscore_headers()
+        for url in FLASHSCORE_URLS:
+            try:
+                resp = await self.session.get(url, headers=headers, timeout=self.timeout)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Flashscore live fetch failed: %s", _public_error(exc))
+                continue
+            status = getattr(resp, "status_code", None)
+            if status != 200:
+                logger.warning("Flashscore live fetch HTTP %s", status)
+                continue
+            text = getattr(resp, "text", None)
+            if text is None and hasattr(resp, "content"):
+                try:
+                    text = (resp.content or b"").decode("utf-8", "replace")
+                except Exception:
+                    text = ""
+            if not (text or "").strip():
+                logger.warning("Flashscore live fetch returned an empty body")
+                continue
+            return matches_from_flashscore_feed(text), True
+        return [], False
 
     async def _load_sofascore(self) -> tuple:
         proxy = sofascore_proxy_url()
