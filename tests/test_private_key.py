@@ -2,7 +2,14 @@
 
 from pathlib import Path
 
-from src.clients.private_key import find_private_key_file, iter_private_key_candidates
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+from src.clients.private_key import (
+    find_private_key_file,
+    iter_private_key_candidates,
+    load_kalshi_private_key,
+)
 
 
 def test_candidates_include_sibling_and_cwd_names(tmp_path, monkeypatch):
@@ -56,3 +63,25 @@ def test_cwd_fallback_when_configured_path_missing(tmp_path, monkeypatch):
     found = find_private_key_file(str(tmp_path / "missing" / "kalshi_private_key.pem"))
     assert found is not None
     assert found.resolve() == cwd_key.resolve()
+
+
+def _rsa_pem() -> str:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+
+def test_env_pem_accepts_escaped_newlines_quotes_and_crlf(monkeypatch):
+    pem = _rsa_pem()
+    escaped = '"' + pem.replace("\n", "\\n") + '"'
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", escaped)
+    loaded, source = load_kalshi_private_key()
+    assert source == "KALSHI_PRIVATE_KEY"
+    assert loaded.private_numbers().d > 0
+
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", pem.replace("\n", "\r\n"))
+    loaded_crlf, _source = load_kalshi_private_key()
+    assert loaded_crlf.private_numbers().d == loaded.private_numbers().d

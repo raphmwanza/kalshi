@@ -85,12 +85,32 @@ Stop with `docker compose down`. Override flags in `.env`:
 | `BOT_STRATEGY` | `tennis` | `tennis`, `safe-compounder`, or `directional` |
 | `BOT_LIVE` | `true` | `true` places real orders |
 | `BOT_LOOP` | `true` | Keep cycling |
-| `BOT_INTERVAL` | `30` | Seconds between cycles |
+| `BOT_INTERVAL` | `30` | Seconds between cycles. Fractions and `0` are allowed; the loop still waits at least 1s, and backs off after errors, HTTP 429s, or SofaScore blocks |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
-Logs are written to `./logs` on the host.
+Logs are written to stdout and, unless `ENABLE_FILE_LOGGING=false`, to `./logs` on the host.
 
 ---
+
+## Railway (worker, no public port)
+
+The same image runs as a Railway worker. It does not listen on a port (`railway.json` sets the Dockerfile builder and `restartPolicyType: ALWAYS`, and the image does not `EXPOSE` one). There is no health check. Configuration is environment variables only — do not bake a `.env` or a private key into the image.
+
+Set these on the service:
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `KALSHI_API_KEY` | yes | Kalshi API key ID |
+| `KALSHI_PRIVATE_KEY` | yes | Full PEM. Real newlines or a single line with `\n` both work; a surrounding pair of quotes is stripped |
+| `BOT_STRATEGY` | no | `tennis` (default), `safe-compounder`, or `directional` |
+| `BOT_LIVE` | no | `true` places real orders |
+| `BOT_LOOP` | no | `true` (default) keeps cycling |
+| `BOT_INTERVAL` | no | Seconds between cycles. `0` or `0.5` are valid. The process still pauses at least 1 second, and after a failed cycle, a Kalshi 429, or a SofaScore block/403 the wait doubles up to 60 seconds |
+| `LOG_LEVEL` | no | `INFO` |
+| `ENABLE_FILE_LOGGING` | no | Set `false` on Railway. Logs always go to stdout, which Railway collects |
+| `KALSHI_BASE_URL` | no | Leave unset unless you mean to override the production host |
+
+`KALSHI_PRIVATE_KEY_PATH` is unnecessary when `KALSHI_PRIVATE_KEY` is set. Do not commit the PEM.
 
 ---
 
@@ -215,12 +235,12 @@ cp env.template .env
 |---|---|
 | `KALSHI_API_KEY` | Your Kalshi API key ID |
 | `KALSHI_PRIVATE_KEY_PATH` | Path to the RSA PEM (default `kalshi_private_key.pem`) |
-| `KALSHI_PRIVATE_KEY` | Optional PEM body; if set, used instead of the file |
+| `KALSHI_PRIVATE_KEY` | Optional PEM body; if set, used instead of the file. Escaped `\n`, real newlines, and surrounding quotes are accepted |
 | `OPENROUTER_API_KEY` | OpenRouter key (only for AI directional strategy) |
 | `BOT_STRATEGY` | Docker: `tennis`, `safe-compounder`, or `directional` |
 | `BOT_LIVE` | Docker: `true` to pass `--live` |
 | `BOT_LOOP` | Docker: keep looping |
-| `BOT_INTERVAL` | Docker: seconds between cycles |
+| `BOT_INTERVAL` | Seconds between cycles (fractions and 0 allowed; 1s minimum, backoff on errors) |
 
 Place your Kalshi private key as `kalshi_private_key.pem` in the project root (`kalshi_private_key` with no extension also works). Download it from [Kalshi Settings → API](https://kalshi.com/account/settings). It's git-ignored.
 

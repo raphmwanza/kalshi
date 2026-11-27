@@ -339,6 +339,8 @@ class SafeCompounder:
         print(f"  Elapsed:              {elapsed:.0f}s", flush=True)
         print(f"{'='*70}\n", flush=True)
 
+        if getattr(self.client, "hit_rate_limit", False):
+            stats["needs_backoff"] = True
         return stats
 
     async def _fetch_all_markets(self) -> List[Dict]:
@@ -600,20 +602,38 @@ class SafeCompounder:
         """Place NO-side resting orders at lowest_ask - 1¢."""
         # Get existing positions and orders
         try:
-            positions_resp = await self.client.get_positions()
-            positions = positions_resp.get("market_positions", [])
-            pos_tickers = {
-                p["ticker"] for p in positions if abs(p.get("position", 0)) > 0
+            positions = await self.client.list_market_positions()
+            orders = await self.client.list_orders(status="resting")
+        except Exception as exc:  # noqa: BLE001
+            # Fail closed. An empty ticker set would disable the duplicate check.
+            logger.error(
+                "Positions or orders lookup failed; skipping new orders this cycle: %s",
+                exc,
+            )
+            print(
+                "🛑 Positions or orders lookup failed — skipping new orders this cycle",
+                flush=True,
+            )
+            return {
+                "placed": 0,
+                "skipped_existing": 0,
+                "skipped_size": 0,
+                "filled": 0,
+                "errors": 1,
+                "total_potential_profit": 0,
+                "total_deployed": 0,
+                "needs_backoff": True,
             }
-        except Exception:
-            pos_tickers = set()
 
-        try:
-            orders_resp = await self.client.get_orders(status="resting")
-            existing_orders = orders_resp.get("orders", [])
-            ord_tickers = {o["ticker"] for o in existing_orders}
-        except Exception:
-            ord_tickers = set()
+        def _abs_qty(position: Dict) -> float:
+            raw = position.get("position_fp", position.get("position"))
+            try:
+                return abs(float(raw or 0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        pos_tickers = {p["ticker"] for p in positions if _abs_qty(p) > 0}
+        ord_tickers = {o["ticker"] for o in orders if o.get("ticker")}
 
         stats = {
             "placed": 0,
@@ -737,13 +757,14 @@ class SafeCompounder:
     async def _cancel_yes_orders(self) -> int:
         """Cancel any resting YES-side orders (legacy)."""
         try:
-            orders_resp = await self.client.get_orders(status="resting")
-            orders = orders_resp.get("orders", [])
+            orders = await self.client.list_orders(status="resting")
             yes_orders = [o for o in orders if o.get("side") == "yes"]
             cancelled = 0
             for o in yes_orders:
                 try:
-                    await self.client.cancel_order(o["order_id"])
+                    await self.client.cancel_order(
+                        o["order_id"], market_ticker=o.get("ticker")
+                    )
                     yes_price = o.get('yes_price', 0)
                     if isinstance(yes_price, (int, float)) and yes_price > 0:
                         # Convert cents to dollars if needed for display
@@ -780,8 +801,7 @@ class SafeCompounder:
         )
 
         try:
-            orders_resp = await self.client.get_orders(status="resting")
-            resting = orders_resp.get("orders", [])
+            resting = await self.client.list_orders(status="resting")
             no_resting = [o for o in resting if o.get("side") == "no"]
             yes_resting = [o for o in resting if o.get("side") == "yes"]
             print(
