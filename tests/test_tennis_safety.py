@@ -251,7 +251,7 @@ async def test_buy_is_ioc_and_reserves_the_fee():
     assert "expiration_ts" not in order
     assert len(sells) == 1
     assert sells[0]["time_in_force"] == "good_till_canceled"
-    assert sells[0]["yes_price"] == 99
+    assert sells[0]["yes_price"] == 94
     assert stats["placed"] == 1
 
 
@@ -297,7 +297,7 @@ async def test_duplicate_and_cap_block_entries():
         "status": "resting",
         "action": "sell",
         "side": "yes",
-        "yes_price_dollars": "0.99",
+        "yes_price_dollars": "0.94",
         "remaining_count_fp": "2.00",
     }]
     await _strategy(client, [_live_alcaraz()]).run()
@@ -351,7 +351,7 @@ async def test_non_tennis_positions_are_not_managed():
 
 
 @pytest.mark.asyncio
-async def test_no_position_keeps_a_99c_sell():
+async def test_no_position_keeps_a_94c_sell():
     client = FakeKalshi()
     client.positions = [{
         "ticker": ALCARAZ,
@@ -359,16 +359,16 @@ async def test_no_position_keeps_a_99c_sell():
         "market_exposure_dollars": "1.00",
     }]
     client.orders = [{
-        "order_id": "no-99",
+        "order_id": "no-94",
         "ticker": ALCARAZ,
         "status": "resting",
         "action": "sell",
         "side": "no",
-        "yes_price_dollars": "0.01",
-        "no_price_dollars": "0.99",
+        "yes_price_dollars": "0.06",
+        "no_price_dollars": "0.94",
         "remaining_count_fp": "4.00",
     }]
-    # NO bid is 76c, above the stop, so the resting 99c NO sell must stay.
+    # NO bid is 76c, above the stop, so the resting 94c NO sell must stay.
     client.events = [_alcaraz_event(ask="0.22", bid="0.18")]
     await _strategy(client, [])._manage_open_positions(_manage_stats())
     assert client.placed == []
@@ -389,7 +389,7 @@ async def test_no_exit_recognized_from_book_side_when_action_is_absent():
         "status": "resting",
         "book_side": "bid",
         "yes_price_dollars": "0.01",
-        "no_price_dollars": "0.99",
+        "no_price_dollars": "0.94",
         "remaining_count_fp": "4.00",
     }]
     client.events = [_alcaraz_event(ask="0.22", bid="0.18")]

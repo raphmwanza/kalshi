@@ -24,9 +24,10 @@ the tier fraction is skipped entirely and the whole cash balance is staked.
 
 EXITS
 -----
-  * Take profit (99c): placed as a RESTING sell "cash-out line" directly on
-    Kalshi's book — right after entry and reconciled every cycle. Because it
-    lives on the exchange it fills even if this bot is stopped.
+  * Take profit (94c): placed as a RESTING sell "cash-out line" directly on
+    Kalshi's book — right after entry and again on the slow portfolio sync.
+    Because it lives on the exchange it fills even if this bot is stopped.
+    A leftover 99c line is cancelled and replaced with 94c on that sync.
   * Stop loss (35c): Kalshi has no native stop/trigger order, so this is
     polled each cycle and only fires WHILE THE BOT IS RUNNING. It sells 100%
     of every tennis position this strategy owns once its bid falls to or
@@ -55,6 +56,7 @@ Available via: python cli.py run --tennis
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -102,11 +104,11 @@ MATCH_WINNER_SERIES = (
 MATCH_WINNER_PREFIXES = MATCH_WINNER_SERIES + ("KXTENNISMATCH",)
 
 MIN_WIN_PROBABILITY = 0.75   # buy when implied win chance is at least 75%
-MAX_ENTRY_PRICE = 0.90       # cap entry at 90c so there is headroom to the 99c cashout
+MAX_ENTRY_PRICE = 0.90       # cap entry at 90c so there is headroom to the 94c cashout
 MIN_SET_TO_ENTER = 3         # only trade once the match reaches set 3
 MIN_GAME_LEAD = 2            # backed player must be up by >= 2 games in the live set
 BANKROLL_CAP_USD = 5_000.0   # treat any total money above this as exactly this
-SELL_ALL_AT = 0.99           # always sell every held position once it hits 99c
+SELL_ALL_AT = 0.94           # resting cash-out line. Override with SELL_ALL_AT.
 STOP_LOSS_AT = 0.35          # cut losses: sell if the live bid falls to/below 35c
 # 0 = every tennis position, including small accounts. A positive value would
 # again leave stakes under that dollar amount without a stop.
@@ -131,7 +133,7 @@ CASH_RESERVE_KEEP_TIGHT = 0.70  # keep this fraction when cash >= $50
 # --- Set-3 ranking "upset" overlay -----------------------------------------
 # When a credible ranked favorite is LOSING to a much lower-ranked / unranked
 # player in set 3, the normal "back the favorite" logic is wrong. Instead we
-# back the surging UNDERDOG cheaply and ride it to the 99c cash-out — but only
+# back the surging UNDERDOG cheaply and ride it to the 94c cash-out — but only
 # when the upset is early/credible, otherwise we sit out entirely.
 RANK_UPSET_ENABLED = True
 RANK_UPSET_MAX_FAV_RANK = 500   # favorite must be ranked <= 500 to be "credible"
@@ -506,6 +508,53 @@ def _position_stake_usd(p: Dict) -> float:
         return 0.0
 
 
+class KalshiCallCounter:
+    """Count awaited Kalshi client calls so a quiet cycle can prove it made none."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls: List[str] = []
+
+    def reset_calls(self) -> None:
+        self.calls.clear()
+
+    def __getattr__(self, name):
+        attr = getattr(self._inner, name)
+        if not callable(attr):
+            return attr
+
+        def wrapped(*args, **kwargs):
+            result = attr(*args, **kwargs)
+            if hasattr(result, "__await__"):
+                self.calls.append(name)
+            return result
+
+        return wrapped
+
+
+def _sync_seconds() -> float:
+    raw = os.environ.get("KALSHI_SYNC_SECONDS", "").strip()
+    if not raw:
+        return 60.0
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 60.0
+
+
+def _sell_all_default() -> float:
+    raw = os.environ.get("SELL_ALL_AT", "").strip()
+    if not raw:
+        return SELL_ALL_AT
+    try:
+        price = float(raw)
+    except ValueError:
+        return SELL_ALL_AT
+    if 0.01 <= price <= 0.99:
+        return price
+    return SELL_ALL_AT
+
+
 class TennisSet3Strategy:
     """Buy the set-3 favorite (75–90% implied) with tiered position sizing."""
 
@@ -534,7 +583,7 @@ class TennisSet3Strategy:
         journal=None,
         skip_rounds: Optional[str] = None,
     ):
-        self.client = client
+        self.client = client if isinstance(client, KalshiCallCounter) else KalshiCallCounter(client)
         self.sofascore = sofascore or SofaScoreClient()
         self._owns_sofascore = sofascore is None
         self.dry_run = dry_run
@@ -547,7 +596,13 @@ class TennisSet3Strategy:
         self.min_set = min_set
         self.min_game_lead = min_game_lead
         self.best_of_three_only = best_of_three_only
-        self.sell_all_at = sell_all_at
+        self.sell_all_at = _sell_all_default() if sell_all_at == SELL_ALL_AT else sell_all_at
+        self.sync_seconds = _sync_seconds()
+        self._book_positions = None
+        self._book_orders = None
+        self._book_synced_at = 0.0
+        self._balance = None
+        self._balance_at = 0.0
         self.stop_loss_at = stop_loss_at
         self.stop_loss_min_stake = stop_loss_min_stake
         self.all_in_below_cash = all_in_below_cash
@@ -615,76 +670,10 @@ class TennisSet3Strategy:
             "stopped_contracts": 0,
         }
 
-        # 0. Manage open positions first, every cycle, before anything else:
-        #    - take profit: ensure a resting SELL "cash-out line" at 99c sits on
-        #      Kalshi for every position, so it fills even if this code is off.
-        #    - stop loss: Kalshi has no native stop, so we poll — sell any
-        #      tennis position whose live bid has fallen to/below 35c. A missing
-        #      or zero bid does not fire the stop.
-        await self._manage_open_positions(stats)
-
-        # 1. Bankroll + target stake
-        bal = await self.client.get_balance()
-        cash = float(bal.get("balance", 0)) / 100.0
-        portfolio = float(bal.get("portfolio_value", 0)) / 100.0
-        total_money = cash + portfolio
-        starting_cash = cash
-
-        # Cash-reserve is PRIORITY: lock how much we may spend this cycle so a
-        # losing streak can't drain the account. Computed once from starting
-        # cash so a mid-cycle drop doesn't flip us into all-in.
-        keep_frac = cash_keep_fraction(
-            starting_cash,
-            half_at=self.cash_reserve_half_usd,
-            tight_at=self.cash_reserve_tight_usd,
-        )
-        spendable = max_spendable_cash(
-            starting_cash,
-            half_at=self.cash_reserve_half_usd,
-            tight_at=self.cash_reserve_tight_usd,
-        )
-
-        # When cash is very small, dividing by the tier fraction leaves too
-        # little to trade — go all-in on available cash instead of a fraction.
-        # The reserve (cash >= $20) overrides this: we never all-in past it.
-        all_in = cash < self.all_in_below_cash and keep_frac == 0.0
-        if all_in:
-            stake = cash
-        else:
-            stake = target_stake_usd(total_money)
-        # Per-trade stake cannot exceed the cycle spend cap.
-        stake = min(stake, spendable, cash)
-
-        print(
-            f"\n👤 {self.account_name}  💰 Cash: ${cash:,.2f} | Positions: ${portfolio:,.2f} | "
-            f"Total: ${total_money:,.2f}",
-            flush=True,
-        )
-        await self._print_daily_win_pct()
-        if keep_frac > 0:
-            print(
-                f"🛡️ Cash reserve PRIORITY: keep {keep_frac*100:.0f}% "
-                f"(${starting_cash * keep_frac:,.2f}) — max deploy this cycle "
-                f"${spendable:,.2f} of ${starting_cash:,.2f}",
-                flush=True,
-            )
-        if all_in:
-            print(
-                f"🎯 Cash < ${self.all_in_below_cash:,.0f}: going all-in — "
-                f"stake = ${stake:,.2f} (whole cash balance)\n",
-                flush=True,
-            )
-        else:
-            print(
-                f"🎯 Tier stake: {stake_fraction(total_money):.3f} of "
-                f"${min(total_money, BANKROLL_CAP_USD):,.2f} = ${stake:,.2f} per trade "
-                f"(capped by cash + reserve)\n",
-                flush=True,
-            )
-
-        # 2. Live tennis matches that are actionable right now: either in
-        #    set 3+, OR a player won set 1 and is currently leading set 2
-        #    (on track for a straight-sets win that never reaches set 3).
+        # Scores decide the cycle before any Kalshi call. The 2s loop should
+        # not touch the exchange when nothing is actionable and nothing is open.
+        if hasattr(self.client, "reset_calls"):
+            self.client.reset_calls()
         if live_matches is None:
             print("📡 Fetching live tennis matches...", flush=True)
             live_matches = await self.sofascore.get_live_tennis_matches()
@@ -714,7 +703,6 @@ class TennisSet3Strategy:
                 f"({m.score_label()}) ({m.status_description})",
                 flush=True,
             )
-
         if not actionable_matches:
             waiting = [
                 m for m in live_matches
@@ -728,8 +716,46 @@ class TennisSet3Strategy:
                         f"({m.score_label()}) — {self._why_not_actionable(m)}",
                         flush=True,
                     )
+
+        sync_due = self._sync_due()
+        if not actionable_matches and not sync_due and not self._has_cached_tennis_exposure():
             print("\nNo actionable tennis matches right now. Nothing to do.\n", flush=True)
-            return await self._finish(stats, start)
+            return await self._finish(stats, start, sync_journal=False)
+
+        if sync_due:
+            await self._sync_portfolio(stats)
+            await self._load_and_print_balance()
+            await self._print_daily_win_pct()
+        elif self._has_cached_tennis_exposure():
+            await self._poll_stop_bids(stats)
+
+        if not actionable_matches:
+            print("\nNo actionable tennis matches right now. Nothing to do.\n", flush=True)
+            return await self._finish(stats, start, sync_journal=sync_due)
+
+        if self._balance is None or (time.monotonic() - self._balance_at) >= self.sync_seconds:
+            await self._load_and_print_balance()
+        bal = self._balance or {"balance": 0, "portfolio_value": 0}
+        cash = float(bal.get("balance", 0)) / 100.0
+        portfolio = float(bal.get("portfolio_value", 0)) / 100.0
+        total_money = cash + portfolio
+        starting_cash = cash
+        keep_frac = cash_keep_fraction(
+            starting_cash,
+            half_at=self.cash_reserve_half_usd,
+            tight_at=self.cash_reserve_tight_usd,
+        )
+        spendable = max_spendable_cash(
+            starting_cash,
+            half_at=self.cash_reserve_half_usd,
+            tight_at=self.cash_reserve_tight_usd,
+        )
+        all_in = cash < self.all_in_below_cash and keep_frac == 0.0
+        if all_in:
+            stake = cash
+        else:
+            stake = target_stake_usd(total_money)
+        stake = min(stake, spendable, cash)
 
         # 3. Kalshi tennis MATCH-WINNER markets (no prop/spread markets)
         print("\n📊 Fetching Kalshi tennis match-winner markets...", flush=True)
@@ -794,17 +820,20 @@ class TennisSet3Strategy:
         # 4. Existing exposure (skip tickers we already touch). If either
         # lookup fails, do not enter: an empty result would disable the
         # duplicate check and the position cap.
-        exposure = await self._load_exposure()
-        if exposure is None:
-            stats["errors"] += 1
-            stats["entries_blocked"] = 1
-            stats["needs_backoff"] = True
-            print(
-                "🛑 Positions or orders lookup failed — skipping new entries this cycle",
-                flush=True,
-            )
-            return await self._finish(stats, start)
-        held, open_count = exposure
+        if self._book_positions is None:
+            exposure = await self._load_exposure()
+            if exposure is None:
+                stats["errors"] += 1
+                stats["entries_blocked"] = 1
+                stats["needs_backoff"] = True
+                print(
+                    "🛑 Positions or orders lookup failed — skipping new entries this cycle",
+                    flush=True,
+                )
+                return await self._finish(stats, start, sync_journal=False)
+            held, open_count = exposure
+        else:
+            held, open_count = self._exposure_from_cache()
         traded_events: set = set()  # avoid two bets on the same match this cycle
         # Concurrency guard: how many positions are already open, plus how many
         # new bets we place this cycle, must stay under the cap.
@@ -1034,9 +1063,11 @@ class TennisSet3Strategy:
             cash = max(0.0, cash - debit)
             spendable = max(0.0, spendable - debit)
 
-        return await self._finish(stats, start)
+        if stats.get("placed") or stats.get("stopped_positions") or stats.get("tp_lines_set"):
+            await self._refresh_book()
+        return await self._finish(stats, start, sync_journal=True)
 
-    async def _finish(self, stats: Dict, start: float) -> Dict:
+    async def _finish(self, stats: Dict, start: float, *, sync_journal: bool = True) -> Dict:
         elapsed = time.time() - start
         print(f"\n{'='*70}", flush=True)
         print("🎾 TENNIS SET-3 REPORT", flush=True)
@@ -1058,18 +1089,114 @@ class TennisSet3Strategy:
         print(f"  Errors:              {stats['errors']}", flush=True)
         print(f"  Mode:                {'DRY RUN' if self.dry_run else 'LIVE'}", flush=True)
         print(f"  Elapsed:             {elapsed:.0f}s", flush=True)
-        rec = await self._daily_record()
-        if rec is not None:
-            print(f"  {format_daily_win_line(rec)}", flush=True)
+        if sync_journal:
+            rec = await self._daily_record()
+            if rec is not None:
+                print(f"  {format_daily_win_line(rec)}", flush=True)
+        calls = list(getattr(self.client, "calls", []) or [])
+        stats["kalshi_calls"] = len(calls)
+        if calls:
+            print(f"  Kalshi calls this cycle: {len(calls)}", flush=True)
+            logger.info("Kalshi calls this cycle: %s", len(calls))
+        else:
+            print("  scores only, no Kalshi calls", flush=True)
+            logger.info("scores only, no Kalshi calls")
         print(f"{'='*70}\n", flush=True)
         if getattr(self.sofascore, "last_fetch_blocked", False) or getattr(
             self.client, "hit_rate_limit", False
         ):
             stats["needs_backoff"] = True
-        await self._record_sell_fills()
+        if sync_journal or stats.get("placed") or stats.get("stopped_positions"):
+            await self._record_sell_fills()
         if self._owns_sofascore:
             await self.sofascore.close()
         return stats
+
+    def _sync_due(self) -> bool:
+        if self._book_positions is None:
+            return True
+        return (time.monotonic() - self._book_synced_at) >= self.sync_seconds
+
+    def _cached_tennis_positions(self) -> List[Dict]:
+        rows = self._book_positions or []
+        return [
+            row for row in rows
+            if row.get("ticker") and _position_qty(row) != 0
+            and _is_match_winner_ticker(row.get("ticker") or "")
+        ]
+
+    def _cached_tennis_orders(self) -> List[Dict]:
+        return [
+            order for order in (self._book_orders or [])
+            if _is_match_winner_ticker(order.get("ticker") or "")
+        ]
+
+    def _has_cached_tennis_exposure(self) -> bool:
+        if self._book_positions is None:
+            return False
+        return bool(self._cached_tennis_positions() or self._cached_tennis_orders())
+
+    def _exposure_from_cache(self) -> Tuple[set, int]:
+        held: set = set()
+        open_count = 0
+        for position in self._book_positions or []:
+            ticker = position.get("ticker")
+            if not ticker or _position_qty(position) == 0:
+                continue
+            held.add(ticker)
+            open_count += 1
+        for order in self._book_orders or []:
+            ticker = order.get("ticker")
+            if ticker:
+                held.add(ticker)
+        return held, open_count
+
+    async def _refresh_book(self) -> bool:
+        """Reload positions and resting orders. Does not place or cancel."""
+        try:
+            rows = await self.client.list_market_positions()
+            orders = await self.client.list_orders(status="resting")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Portfolio refresh failed: %s", exc)
+            return False
+        self._book_positions = list(rows or [])
+        self._book_orders = list(orders or [])
+        self._book_synced_at = time.monotonic()
+        return True
+
+    async def _sync_portfolio(self, stats: Dict) -> None:
+        """Slow sync. A resting cash-out that is not at sell_all_at is replaced."""
+        if not await self._refresh_book():
+            stats["needs_backoff"] = True
+            stats["errors"] += 1
+            return
+        positions = self._cached_tennis_positions()
+        if not positions:
+            return
+        await self._apply_exit_rules(
+            stats, positions, list(self._book_orders or []), ensure_take_profit=True
+        )
+
+    async def _poll_stop_bids(self, stats: Dict) -> None:
+        """One get_market per open tennis position. The cash-out line is left resting."""
+        positions = self._cached_tennis_positions()
+        if not positions:
+            return
+        await self._apply_exit_rules(
+            stats, positions, list(self._book_orders or []), ensure_take_profit=False
+        )
+
+    async def _load_and_print_balance(self) -> None:
+        bal = await self.client.get_balance()
+        self._balance = bal
+        self._balance_at = time.monotonic()
+        cash = float(bal.get("balance", 0)) / 100.0
+        portfolio = float(bal.get("portfolio_value", 0)) / 100.0
+        print(
+            f"\n👤 {self.account_name}  💰 Cash: ${cash:,.2f} | Positions: ${portfolio:,.2f} | "
+            f"Total: ${cash + portfolio:,.2f}",
+            flush=True,
+        )
 
     async def _print_daily_win_pct(self) -> None:
         rec = await self._daily_record()
@@ -1461,7 +1588,7 @@ class TennisSet3Strategy:
                     f"{player} (set {match.current_set} {match.score_label()}) | {ticker}",
                     flush=True,
                 )
-                # Immediately rest the 99c cash-out line for what we now hold, so
+                # Immediately rest the 94c cash-out line for what we now hold, so
                 # the take-profit survives even if the bot is stopped right away.
                 await self._place_take_profit_line(ticker, side, filled, stats)
             else:
@@ -1522,8 +1649,8 @@ class TennisSet3Strategy:
             ``stop_loss_min_stake`` is set above 0, this applies to every
             stake. The sell is immediate-or-cancel and reduce-only, and it is
             sent only after resting orders on the ticker were cancelled.
-          * TAKE PROFIT — a resting sell at ``sell_all_at`` (99c) on the same
-            side as the position. The price is read on that side, so a 99c NO
+          * TAKE PROFIT — a resting sell at ``sell_all_at`` (94c) on the same
+            side as the position. The price is read on that side, so a 94c NO
             sell (1c on the YES book) counts as already working.
         """
         try:
@@ -1555,8 +1682,23 @@ class TennisSet3Strategy:
             stats["needs_backoff"] = True
             return
 
+        self._book_positions = list(rows)
+        self._book_orders = list(resting)
+        self._book_synced_at = time.monotonic()
+        await self._apply_exit_rules(stats, positions, resting, ensure_take_profit=True)
+
+    async def _apply_exit_rules(
+        self,
+        stats: Dict,
+        positions: List[Dict],
+        resting: List[Dict],
+        *,
+        ensure_take_profit: bool,
+    ) -> None:
         tp_cents = max(1, min(99, int(round(self.sell_all_at * 100))))
-        cancel_failed = await self._cancel_stale_exits(positions, resting, tp_cents)
+        cancel_failed: set = set()
+        if ensure_take_profit:
+            cancel_failed = await self._cancel_stale_exits(positions, resting, tp_cents)
 
         if self.stop_loss_min_stake <= 0:
             stop_label = "every tennis position"
@@ -1588,7 +1730,7 @@ class TennisSet3Strategy:
                 continue
 
             # Once Kalshi has closed/settled the market the match is over — a
-            # resting 99c sell will 409 ``market_closed``. Leave the position
+            # resting cash-out sell will 409 ``market_closed``. Leave the position
             # to settle; don't spam errors every cycle.
             status = (market.get("status") or "").lower()
             if status in ("closed", "settled", "finalized", "determined", "inactive"):
@@ -1633,6 +1775,8 @@ class TennisSet3Strategy:
                 )
                 continue
 
+            if not ensure_take_profit:
+                continue
             if ticker in cancel_failed:
                 logger.error(
                     "Take-profit top-up skipped for %s; a stale exit could not be cancelled",
@@ -1644,15 +1788,16 @@ class TennisSet3Strategy:
             uncovered = qty - covered
             if uncovered > 0:
                 await self._place_take_profit_line(ticker, side, uncovered, stats)
+                self._book_synced_at = 0.0
 
     async def _place_take_profit_line(
         self, ticker: str, side: str, qty: int, stats: Dict
     ) -> None:
-        """Rest a SELL at the take-profit price (99c) on Kalshi.
+        """Rest a SELL at the take-profit price (94c by default) on Kalshi.
 
         This is the "cash-out line": it sits on the exchange book and fills
-        whenever the market reaches 99c, independent of whether this bot is
-        running. If the market is already at/above 99c it simply fills now.
+        whenever the market reaches that price, independent of whether this bot is
+        running. If the market is already at or above it, the order can fill now.
         """
         price_cents = max(1, min(99, int(round(self.sell_all_at * 100))))
         client_order_id = str(uuid.uuid4())
@@ -1669,7 +1814,7 @@ class TennisSet3Strategy:
         try:
             # NOTE: no ``reduce_only`` here. Kalshi only allows reduce_only on
             # IoC orders ("reduce_only can only be used with IoC orders"), and a
-            # take-profit line must REST (good_till_canceled) so it fills at 99c
+            # take-profit line must REST (good_till_canceled) so it fills at 94c
             # even while this bot is stopped. Selling exactly the quantity we
             # hold closes the position, so reduce_only isn't needed anyway.
             kwargs = dict(
@@ -1724,7 +1869,9 @@ class TennisSet3Strategy:
         """Cancel resting exits that are not at the cash-out price.
 
         Returns tickers whose cancel failed. The price is compared on the
-        position's side, so a 99c NO sell is kept.
+        position's side, so a cash-out NO sell at the target price is kept.
+        A resting 99c line is not the target once the cash-out is 94c, so it
+        is cancelled and replaced.
         """
         side_of = {
             p["ticker"]: "yes" if _position_qty(p) > 0 else "no" for p in positions
