@@ -174,6 +174,10 @@ _ROUND_ALIASES = {
     "finals": "final",
     "the final": "final",
     "grand final": "final",
+    "championship": "final",
+    "championships": "final",
+    "championship match": "final",
+    "title match": "final",
     "qf": "quarterfinal",
     "quarterfinal": "quarterfinal",
     "quarterfinals": "quarterfinal",
@@ -198,15 +202,19 @@ def classify_round_label(label: str) -> Optional[str]:
         return None
     if text in _ROUND_ALIASES:
         return _ROUND_ALIASES[text]
+    # Quarterfinal contains the letters "final". Match it before any final rule
+    # so "Quarterfinal" and "Quarter-final" are not treated as the final.
     if re.search(r"\bquarter\s*finals?\b", text):
         return "quarterfinal"
     if re.search(r"\bsemi\s*finals?\b", text) or re.search(r"(^|[\s:/])sf($|[\s:/])", text):
         return "semifinal"
+    if re.search(r"\b(championship|title)\s+match\b", text) or re.search(r"\bchampionships?\b", text):
+        return "final"
     if re.fullmatch(r"(the |grand )?finals?", text):
         return "final"
     if re.search(r"\b(atp|wta|nitto)\s+finals\b", text):
         return None
-    if re.search(r"\bfinal\b", text):
+    if re.search(r"\bfinal\b", text) and not re.search(r"\bquarter\s*final", text):
         return "final"
     if re.search(r"\bround of (16|32|64|128)\b", text) or re.search(r"\br(16|32|64|128)\b", text):
         return "earlier"
@@ -249,14 +257,19 @@ def detect_round(
     return "unknown"
 
 
-def parse_skip_rounds(raw: Optional[str] = None) -> set:
-    """Rounds that must not be entered. Default is semifinal only.
+# Semifinal and everything later: the final and championship matches.
+DEFAULT_SKIP_ROUNDS = "semifinal,final"
 
-    ``none``, ``off``, or an empty string disables the filter. Commas separate
-    names: ``semifinal,final``.
+
+def parse_skip_rounds(raw: Optional[str] = None) -> set:
+    """Rounds that must not be entered.
+
+    The default is semifinal and final (semifinal and above), including a
+    championship match, which is classified as a final. ``none``, ``off``, or
+    an empty string disables the filter.
     """
     if raw is None:
-        raw = os.environ.get("SKIP_ROUNDS", "semifinal")
+        raw = os.environ.get("SKIP_ROUNDS", DEFAULT_SKIP_ROUNDS)
     text = (raw or "").strip().lower()
     if text in {"", "none", "off", "false", "0"}:
         return set()

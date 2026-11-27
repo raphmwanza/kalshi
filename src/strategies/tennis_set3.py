@@ -539,7 +539,7 @@ class TennisSet3Strategy:
         self.dry_run = dry_run
         self.account_name = account_name or "default"
         self.journal = journal
-        # None means read SKIP_ROUNDS, which defaults to semifinal.
+        # None means read SKIP_ROUNDS, which defaults to semifinal and final.
         self.skip_rounds = parse_skip_rounds(skip_rounds)
         self.min_win_probability = min_win_probability
         self.max_entry_price = max_entry_price

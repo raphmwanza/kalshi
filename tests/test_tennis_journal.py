@@ -18,7 +18,9 @@ from src.strategies.tennis_set3 import TennisSet3Strategy
 from tests.test_tennis_safety import FakeKalshi, FakeSofa, _alcaraz_event, _live_alcaraz
 
 
-def test_round_detection_and_skip_config():
+def test_round_detection_and_skip_config(monkeypatch):
+    monkeypatch.delenv("SKIP_ROUNDS", raising=False)
+    assert parse_skip_rounds(None) == {"semifinal", "final"}
     assert classify_round_label("Semifinal") == "semifinal"
     assert classify_round_label("Semi-final") == "semifinal"
     assert classify_round_label("SF") == "semifinal"
@@ -26,13 +28,18 @@ def test_round_detection_and_skip_config():
     assert detect_round(round_slug="semifinals") == "semifinal"
     assert detect_round(cup_round_type=2) == "semifinal"
     assert detect_round(extra_labels=["Wimbledon Semifinal: Alcaraz vs Sinner"]) == "semifinal"
+    assert classify_round_label("Quarterfinal") == "quarterfinal"
+    assert classify_round_label("Quarterfinals") == "quarterfinal"
+    assert classify_round_label("Quarter-final") == "quarterfinal"
+    assert classify_round_label("Wimbledon Quarterfinal: A vs B") == "quarterfinal"
     assert detect_round(round_name="Quarterfinals", cup_round_type=4) == "quarterfinal"
+    assert classify_round_label("Final") == "final"
+    assert classify_round_label("Championship") == "final"
+    assert classify_round_label("Championship match") == "final"
     assert detect_round(round_name="Final", cup_round_type=1) == "final"
     assert detect_round(round_name="ATP Finals") == "unknown"
     assert detect_round(round_name="Round of 16") == "earlier"
     assert detect_round() == "unknown"
-    assert parse_skip_rounds(None) == {"semifinal"} or parse_skip_rounds("semifinal") == {"semifinal"}
-    assert "semifinal" in parse_skip_rounds("semifinal")
     assert parse_skip_rounds("semifinal,final") == {"semifinal", "final"}
     assert parse_skip_rounds("none") == set()
     assert parse_skip_rounds("") == set()
@@ -243,7 +250,8 @@ async def test_runner_isolates_account_errors_and_fetches_sofascore_once():
 
 
 @pytest.mark.asyncio
-async def test_strategy_logs_entries_and_skips_semifinals(tmp_path):
+async def test_strategy_logs_entries_and_skips_semifinals(tmp_path, monkeypatch):
+    monkeypatch.delenv("SKIP_ROUNDS", raising=False)
     journal = SqliteJournal(str(tmp_path / "j.db"))
     client = FakeKalshi()
     client.balance = {"balance": 82, "portfolio_value": 0}
@@ -278,8 +286,8 @@ async def test_strategy_logs_entries_and_skips_semifinals(tmp_path):
     assert skipped["skipped_late_round"] == 2
     assert client.placed == []
 
-    # A final is recognized, so it is not "unknown", and the default filter
-    # only blocks semifinals.
+    # Default SKIP_ROUNDS is semifinal and above, so a final is skipped too.
+    # Quarterfinal still contains the word "final" and must be traded.
     final = _live_alcaraz()
     final.round_name = "Final"
     final.cup_round_type = 1
@@ -290,10 +298,23 @@ async def test_strategy_logs_entries_and_skips_semifinals(tmp_path):
         dry_run=False,
         account_name="main",
         journal=journal,
-        skip_rounds="semifinal",
     ).run(live_matches=[final])
-    assert final_stats["skipped_late_round"] == 0
-    assert client.placed
+    assert final_stats["skipped_late_round"] == 2
+    assert client.placed == []
+
+    quarter = _live_alcaraz()
+    quarter.round_name = "Quarterfinal"
+    quarter.cup_round_type = 4
+    client.placed.clear()
+    quarter_stats = await TennisSet3Strategy(
+        client=client,
+        sofascore=FakeSofa([quarter]),
+        dry_run=False,
+        account_name="main",
+        journal=journal,
+    ).run(live_matches=[quarter])
+    assert quarter_stats["skipped_late_round"] == 0
+    assert quarter_stats["placed"] == 1
 
     # Kalshi title is enough when SofaScore has no round.
     client.placed.clear()
@@ -323,7 +344,7 @@ async def test_strategy_logs_entries_and_skips_semifinals(tmp_path):
         dry_run=False,
         account_name="main",
         journal=journal,
-        skip_rounds="semifinal",
+        skip_rounds="semifinal,final",
     ).run(live_matches=[blank])
     assert allowed["placed"] == 1
     assert allowed["skipped_late_round"] == 0
