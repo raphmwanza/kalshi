@@ -12,13 +12,10 @@ and ``AH`` are sets won. ``WC`` is who is serving (1 home, 2 away).
 
 from __future__ import annotations
 
-import logging
 import os
 from typing import Dict, List, Optional
 
 from src.clients.sofascore_client import LiveTennisMatch, _sets_won
-
-logger = logging.getLogger(__name__)
 
 FIELD = "\u00ac"  # ¬
 KV = "\u00f7"  # ÷
@@ -65,7 +62,8 @@ def _games(fields: Dict[str, str], key: str) -> Optional[int]:
     if raw is None or raw == "":
         return None
     try:
-        return int(raw)
+        value = int(raw)
+        return value if value >= 0 else None
     except ValueError:
         return None
 
@@ -76,22 +74,11 @@ def _set_scores(fields: Dict[str, str]) -> tuple:
     for index, (home_key, away_key) in enumerate(zip(_HOME_GAMES, _AWAY_GAMES), start=1):
         home_games = _games(fields, home_key)
         away_games = _games(fields, away_key)
-        if home_games is None and away_games is None:
+        if home_games is None or away_games is None:
             continue
-        home[f"period{index}"] = 0 if home_games is None else home_games
-        away[f"period{index}"] = 0 if away_games is None else away_games
+        home[f"period{index}"] = home_games
+        away[f"period{index}"] = away_games
     return home, away
-
-
-def _current_set(fields: Dict[str, str], home: Dict[str, int], away: Dict[str, int]) -> int:
-    try:
-        stage = int(fields.get("AC") or 0)
-    except ValueError:
-        stage = 0
-    if stage in _LIVE_SET_STAGE:
-        return _LIVE_SET_STAGE[stage]
-    count = max(len(home), len(away))
-    return count if count else 1
 
 
 def _sets_won_value(fields: Dict[str, str], key: str, home: Dict[str, int], away: Dict[str, int], side: str) -> int:
@@ -114,41 +101,48 @@ def _is_doubles(tournament: str, home: str, away: str) -> bool:
     return "/" in home or "/" in away
 
 
-def _is_live(fields: Dict[str, str]) -> bool:
-    if fields.get("AB") == "2":
-        return True
-    try:
-        stage = int(fields.get("AC") or 0)
-    except ValueError:
-        return False
-    return stage in _LIVE_SET_STAGE
+def parse_flashscore_board(raw: str) -> Optional[List[LiveTennisMatch]]:
+    """Return None for an unrecognizable board, or the list of live singles."""
+    if not raw or raw.lstrip().startswith("<"):
+        return None
+    tournament = ""
+    seen_match = False
+    incomplete_live = False
+    tennis_header = False
+    matches: List[LiveTennisMatch] = []
+    for section in raw.strip().split("~"):
+        fields = _fields(section)
+        if "SA" in fields:
+            if fields["SA"] != "2":
+                return None
+            tennis_header = True
+        if "ZA" in fields:
+            tournament = fields["ZA"]
+        if not fields.get("AA") or not fields.get("AB") or not (tournament or tennis_header):
+            continue
+        if not fields.get("AE") or not fields.get("AF"):
+            continue
+        seen_match = True
+        match = _one_match(fields, tournament)
+        if match is not None:
+            matches.append(match)
+        elif fields["AB"] == "2" and not _is_doubles(tournament, fields["AE"], fields["AF"]):
+            incomplete_live = True
+    if incomplete_live and not matches:
+        return None
+    if seen_match or raw.strip().strip("~¬") == "SA÷2":
+        return matches
+    return None
 
 
 def matches_from_flashscore_feed(raw: str) -> List[LiveTennisMatch]:
     """In-progress singles matches from one Flashscore feed body."""
-    if not raw or not raw.strip():
-        return []
-    tournament = ""
-    matches: List[LiveTennisMatch] = []
-    for section in raw.split("~"):
-        fields = _fields(section)
-        if "ZA" in fields:
-            tournament = fields.get("ZA") or ""
-            continue
-        if "AA" not in fields:
-            continue
-        try:
-            match = _one_match(fields, tournament)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Skipping malformed Flashscore match: %s", exc)
-            continue
-        if match is not None:
-            matches.append(match)
-    return matches
+    return parse_flashscore_board(raw) or []
 
 
 def _one_match(fields: Dict[str, str], tournament: str) -> Optional[LiveTennisMatch]:
-    if not _is_live(fields):
+    current = _LIVE_SET_STAGE.get(_games(fields, "AC"))
+    if fields.get("AB") != "2" or current is None:
         return None
     home_name = (fields.get("AE") or "").strip()
     away_name = (fields.get("AF") or "").strip()
@@ -157,11 +151,8 @@ def _one_match(fields: Dict[str, str], tournament: str) -> Optional[LiveTennisMa
     if _is_doubles(tournament, home_name, away_name):
         return None
     home_score, away_score = _set_scores(fields)
-    current = _current_set(fields, home_score, away_score)
-    # A live set can be 0-0. Keep the period so the strategy sees the set number.
     if f"period{current}" not in home_score:
-        home_score[f"period{current}"] = 0
-        away_score[f"period{current}"] = 0
+        return None
     description = f"set {current}"
     return LiveTennisMatch(
         home_name=home_name,
