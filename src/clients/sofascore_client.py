@@ -30,6 +30,7 @@ Be polite with request frequency — SofaScore will IP-block aggressive polling.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -152,6 +153,134 @@ def players_share_surname(name_a: str, name_b: str) -> bool:
     return bool(tokens_a and tokens_b and tokens_a[-1] == tokens_b[-1])
 
 
+# SofaScore cupRoundType is the number of ties in a full knockout round.
+_CUP_ROUND_KIND = {
+    1: "final",
+    2: "semifinal",
+    4: "quarterfinal",
+    8: "earlier",
+    16: "earlier",
+    32: "earlier",
+    64: "earlier",
+    230: "final",  # qualifying final
+}
+_ROUND_ALIASES = {
+    "sf": "semifinal",
+    "semifinal": "semifinal",
+    "semifinals": "semifinal",
+    "semi final": "semifinal",
+    "semi finals": "semifinal",
+    "final": "final",
+    "finals": "final",
+    "the final": "final",
+    "grand final": "final",
+    "championship": "final",
+    "championships": "final",
+    "championship match": "final",
+    "title match": "final",
+    "qf": "quarterfinal",
+    "quarterfinal": "quarterfinal",
+    "quarterfinals": "quarterfinal",
+    "quarter final": "quarterfinal",
+    "quarter finals": "quarterfinal",
+}
+
+
+def _normalize_round_text(label: str) -> str:
+    text = re.sub(r"[_\-]+", " ", str(label or ""))
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def classify_round_label(label: str) -> Optional[str]:
+    """Map a round name or slug to semifinal, final, quarterfinal, or earlier.
+
+    Returns None when the text is not a round we recognize. "ATP Finals" is a
+    tournament name, not the final round. "SF" and "semifinals" are semifinals.
+    """
+    text = _normalize_round_text(label)
+    if not text:
+        return None
+    if text in _ROUND_ALIASES:
+        return _ROUND_ALIASES[text]
+    # Quarterfinal contains the letters "final". Match it before any final rule
+    # so "Quarterfinal" and "Quarter-final" are not treated as the final.
+    if re.search(r"\bquarter\s*finals?\b", text):
+        return "quarterfinal"
+    if re.search(r"\bsemi\s*finals?\b", text) or re.search(r"(^|[\s:/])sf($|[\s:/])", text):
+        return "semifinal"
+    if re.search(r"\b(championship|title)\s+match\b", text) or re.search(r"\bchampionships?\b", text):
+        return "final"
+    if re.fullmatch(r"(the |grand )?finals?", text):
+        return "final"
+    if re.search(r"\b(atp|wta|nitto)\s+finals\b", text):
+        return None
+    if re.search(r"\bfinal\b", text) and not re.search(r"\bquarter\s*final", text):
+        return "final"
+    if re.search(r"\bround of (16|32|64|128)\b", text) or re.search(r"\br(16|32|64|128)\b", text):
+        return "earlier"
+    if re.search(r"\b(round robin|group|qualification|qualifying|first round|second round)\b", text):
+        return "earlier"
+    return None
+
+
+def cup_round_kind(cup_round_type) -> Optional[str]:
+    try:
+        if cup_round_type is None or cup_round_type == "":
+            return None
+        return _CUP_ROUND_KIND.get(int(cup_round_type))
+    except (TypeError, ValueError):
+        return None
+
+
+def detect_round(
+    round_name: str = "",
+    round_slug: str = "",
+    cup_round_type=None,
+    extra_labels: Optional[List[str]] = None,
+) -> str:
+    """Return semifinal, final, quarterfinal, earlier, or unknown.
+
+    A recognized label or cup-round code wins. Empty metadata is unknown,
+    which the strategy logs and then allows.
+    """
+    kinds = []
+    cup_kind = cup_round_kind(cup_round_type)
+    if cup_kind:
+        kinds.append(cup_kind)
+    for label in (round_name, round_slug, *(extra_labels or [])):
+        kind = classify_round_label(label or "")
+        if kind:
+            kinds.append(kind)
+    for kind in ("semifinal", "final", "quarterfinal", "earlier"):
+        if kind in kinds:
+            return kind
+    return "unknown"
+
+
+# Semifinal and everything later: the final and championship matches.
+DEFAULT_SKIP_ROUNDS = "semifinal,final"
+
+
+def parse_skip_rounds(raw: Optional[str] = None) -> set:
+    """Rounds that must not be entered.
+
+    The default is semifinal and final (semifinal and above), including a
+    championship match, which is classified as a final. ``none``, ``off``, or
+    an empty string disables the filter.
+    """
+    if raw is None:
+        raw = os.environ.get("SKIP_ROUNDS", DEFAULT_SKIP_ROUNDS)
+    text = (raw or "").strip().lower()
+    if text in {"", "none", "off", "false", "0"}:
+        return set()
+    selected = set()
+    for part in text.split(","):
+        key = _normalize_round_text(part).replace(" ", "")
+        spaced = _normalize_round_text(part)
+        selected.add(_ROUND_ALIASES.get(spaced) or _ROUND_ALIASES.get(key) or key)
+    return selected
+
+
 @dataclass
 class LiveTennisMatch:
     """A single in-progress tennis match from SofaScore."""
@@ -161,6 +290,9 @@ class LiveTennisMatch:
     current_set: int
     status_type: str
     status_description: str
+    round_name: str = ""
+    round_slug: str = ""
+    cup_round_type: Optional[int] = None
     home_sets_won: int = 0
     away_sets_won: int = 0
     home_ranking: Optional[int] = None
@@ -428,12 +560,21 @@ class SofaScoreClient:
                 home = home_team.get("name", "") or ""
                 away = away_team.get("name", "") or ""
                 status = ev.get("status") or {}
+                round_info = ev.get("roundInfo") or {}
+                cup_type = round_info.get("cupRoundType")
+                try:
+                    cup_type = int(cup_type) if cup_type is not None else None
+                except (TypeError, ValueError):
+                    cup_type = None
                 match = LiveTennisMatch(
                     home_name=home,
                     away_name=away,
                     current_set=_current_set_number(ev),
                     status_type=status.get("type", ""),
                     status_description=status.get("description", ""),
+                    round_name=str(round_info.get("name") or ""),
+                    round_slug=str(round_info.get("slug") or ""),
+                    cup_round_type=cup_type,
                     home_sets_won=_sets_won(ev, "homeScore", "awayScore"),
                     away_sets_won=_sets_won(ev, "awayScore", "homeScore"),
                     home_ranking=_parse_ranking(home_team.get("ranking")),

@@ -38,6 +38,7 @@ class KalshiClient(TradingLoggerMixin):
         self, 
         api_key: Optional[str] = None, 
         private_key_path: str = None,
+        private_key_pem: Optional[str] = None,
         max_retries: int = 5,
         backoff_factor: float = 0.5
     ):
@@ -47,6 +48,9 @@ class KalshiClient(TradingLoggerMixin):
         Args:
             api_key: Kalshi API key (Key ID from the API key generation)
             private_key_path: Path to private key file
+            private_key_pem: PEM body for this account. When set, it is used
+                instead of ``KALSHI_PRIVATE_KEY`` so multiple accounts can
+                share one process.
             max_retries: Maximum number of retries for failed requests
             backoff_factor: Factor for exponential backoff
         """
@@ -55,6 +59,7 @@ class KalshiClient(TradingLoggerMixin):
         self.private_key_path = private_key_path or os.environ.get(
             "KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key.pem"
         )
+        self._private_key_pem = private_key_pem
         self.private_key = None
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
@@ -82,8 +87,13 @@ class KalshiClient(TradingLoggerMixin):
     def _load_private_key(self) -> None:
         """Load the RSA private key from env contents or a PEM file."""
         try:
-            self.private_key, source = load_kalshi_private_key(self.private_key_path)
-            if source == "KALSHI_PRIVATE_KEY":
+            self.private_key, source = load_kalshi_private_key(
+                self.private_key_path,
+                pem=self._private_key_pem,
+            )
+            if source == "explicit":
+                self.logger.info("Private key loaded from explicit PEM")
+            elif source == "KALSHI_PRIVATE_KEY":
                 self.logger.info("Private key loaded from KALSHI_PRIVATE_KEY")
             else:
                 self.private_key_path = source

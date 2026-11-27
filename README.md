@@ -112,6 +112,48 @@ Set these on the service:
 
 `KALSHI_PRIVATE_KEY_PATH` is unnecessary when `KALSHI_PRIVATE_KEY` is set. Do not commit the PEM.
 
+### Several accounts
+
+One deployment can run the tennis strategy on more than one Kalshi account. Each account has its own client, bankroll, position cap, and journal tag. SofaScore is fetched once per cycle and shared. If one account errors, the others still run.
+
+Set `KALSHI_ACCOUNTS` to a JSON list:
+
+```json
+[{"name":"main","api_key_id":"KEY","private_key":"<PEM body; use \\n between lines>"}]
+```
+
+Or use numbered variables, starting at 1 with no gaps: `KALSHI_ACCOUNT_NAME_1`, `KALSHI_API_KEY_ID_1`, `KALSHI_PRIVATE_KEY_1`, then `_2`, and so on. `KALSHI_API_KEY_1` is an alias for the key id. If neither form is set, the single `KALSHI_API_KEY` / `KALSHI_PRIVATE_KEY` pair is account `default`.
+
+### Journal, report, dashboard
+
+Every entry decision, order, stop, take-profit, and settlement is appended to a journal, tagged with the account name. `DATABASE_URL` starting with `postgres://` or `postgresql://` (what Railway injects for its Postgres) selects Postgres. A `sqlite://` URL uses SQLite. `TRADE_LOG_BACKEND=jsonl` writes `TRADE_LOG_PATH` (default `tennis_journal.jsonl`) instead.
+
+```bash
+python cli.py tennis-report                  # win rate, avg entry, PnL by rule, implied edge
+python cli.py tennis-report --account main
+DASHBOARD_PASSWORD=choose-one python cli.py tennis-dashboard
+```
+
+The settled edge is the realized win rate on contracts held to settlement minus the average entry price. Positive means those entries won more often than the price implied.
+
+### Dashboard service on Railway
+
+Add a second service in the same Railway project from this repo. Leave the trading service as a worker (`BOT_MODE` unset). On the new service:
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `BOT_MODE` | yes | `dashboard`. The image entrypoint then runs `python -m src.journal.web` and does not look for a Kalshi key |
+| `DATABASE_URL` | yes | The same Postgres URL the worker writes. Add it as a variable reference to the Postgres plugin |
+| `DASHBOARD_PASSWORD` | yes | Password for HTTP basic auth. The page refuses to serve journal data when this is empty |
+| `DASHBOARD_USER` | no | Basic-auth username. Default `dashboard` |
+| `PORT` | automatic | Railway sets this. The server binds `0.0.0.0:$PORT` |
+
+Give that service a public domain. Optional health check path: `/healthz` (no journal data, no password). Do not set `BOT_MODE=dashboard` on the trading service.
+
+If the service start command replaces the image entrypoint entirely, set it to `python -m src.journal.web`. If Railway passes the start command through the entrypoint, `dashboard` is enough. The page is read-only: open positions, recent decisions and trades, win rate, cumulative PnL (Chart.js), PnL by entry rule, and the last cycle time for each account. There are no trading controls.
+
+Semifinals and finals are not entered by default (`SKIP_ROUNDS=semifinal,final`). That is semifinal and above: semifinals, the final, and a championship or title match. The round comes from SofaScore `roundInfo` (`name`, `slug`, `cupRoundType` 1 for a final and 2 for a semifinal) or, if that is missing, from the Kalshi event title. `Semifinal`, `Semi-final`, `SF`, `semifinals`, `Final`, and `Championship` all count. `Quarterfinal` and `Quarter-final` do not: the word final inside them is not the final. Set `SKIP_ROUNDS=none` to turn the filter off. If neither source identifies a round, the bot logs that the round is unknown and allows the entry. A tournament named "ATP Finals" is not treated as the final round.
+
 ---
 
 ## What's Included
