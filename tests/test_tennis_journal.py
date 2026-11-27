@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from src.clients.accounts import AccountConfigError, load_kalshi_accounts
 from src.clients.kalshi_client import KalshiClient
 from src.clients.private_key import load_kalshi_private_key
-from src.clients.sofascore_client import is_semifinal_or_later, round_label_is_late
+from src.clients.sofascore_client import classify_round_label, detect_round, parse_skip_rounds
 from src.journal.dashboard import render_dashboard
 from src.journal.summary import summarize_events
 from src.journal.tennis_log import JsonlJournal, SqliteJournal, journal_for_url
@@ -18,19 +18,24 @@ from src.strategies.tennis_set3 import TennisSet3Strategy
 from tests.test_tennis_safety import FakeKalshi, FakeSofa, _alcaraz_event, _live_alcaraz
 
 
-def test_round_filter_skips_semifinal_and_final_only():
-    assert is_semifinal_or_later("Semifinals", None)
-    assert is_semifinal_or_later("semi-final", None)
-    assert is_semifinal_or_later("", 2)
-    assert is_semifinal_or_later("Final", 1)
-    assert is_semifinal_or_later("", 230)
-    assert round_label_is_late("The Final")
-    assert round_label_is_late("Wimbledon Men's Final")
-    assert not is_semifinal_or_later("Quarterfinals", 4)
-    assert not round_label_is_late("Quarter-final")
-    assert not round_label_is_late("ATP Finals")
-    assert not round_label_is_late("Round of 16")
-    assert not is_semifinal_or_later("", None)
+def test_round_detection_and_skip_config():
+    assert classify_round_label("Semifinal") == "semifinal"
+    assert classify_round_label("Semi-final") == "semifinal"
+    assert classify_round_label("SF") == "semifinal"
+    assert classify_round_label("semifinals") == "semifinal"
+    assert detect_round(round_slug="semifinals") == "semifinal"
+    assert detect_round(cup_round_type=2) == "semifinal"
+    assert detect_round(extra_labels=["Wimbledon Semifinal: Alcaraz vs Sinner"]) == "semifinal"
+    assert detect_round(round_name="Quarterfinals", cup_round_type=4) == "quarterfinal"
+    assert detect_round(round_name="Final", cup_round_type=1) == "final"
+    assert detect_round(round_name="ATP Finals") == "unknown"
+    assert detect_round(round_name="Round of 16") == "earlier"
+    assert detect_round() == "unknown"
+    assert parse_skip_rounds(None) == {"semifinal"} or parse_skip_rounds("semifinal") == {"semifinal"}
+    assert "semifinal" in parse_skip_rounds("semifinal")
+    assert parse_skip_rounds("semifinal,final") == {"semifinal", "final"}
+    assert parse_skip_rounds("none") == set()
+    assert parse_skip_rounds("") == set()
 
 
 def test_summary_win_rate_pnl_and_implied_edge():
@@ -139,14 +144,13 @@ def test_account_config_json_numbered_and_fallback(monkeypatch):
     monkeypatch.setenv(
         "KALSHI_ACCOUNTS",
         json.dumps([
-            {"name": "main", "api_key_id": "key-1", "private_key": "-----BEGIN RSA PRIVATE KEY-----\\nABC\\n-----END RSA PRIVATE KEY-----"},
-            {"name": "backup", "api_key": "key-2", "private_key": "-----BEGIN RSA PRIVATE KEY-----\nDEF\n-----END RSA PRIVATE KEY-----\n"},
+            {"name": "main", "api_key_id": "key-1", "private_key": "line-one\\nline-two"},
+            {"name": "backup", "api_key": "key-2", "private_key": "line-one\nline-two\n"},
         ]),
     )
     accounts = load_kalshi_accounts()
     assert [a.name for a in accounts] == ["main", "backup"]
-    assert "\n" in accounts[0].private_key
-    assert accounts[0].private_key.startswith("-----BEGIN")
+    assert accounts[0].private_key.startswith("line-one\nline-two")
     assert accounts[1].api_key == "key-2"
 
     monkeypatch.delenv("KALSHI_ACCOUNTS")
@@ -266,11 +270,77 @@ async def test_strategy_logs_entries_and_skips_semifinals(tmp_path):
 
     client.placed.clear()
     late = _live_alcaraz()
-    late.round_name = "Semifinal"
+    late.round_name = "Semi-final"
+    late.round_slug = "semifinals"
     late.cup_round_type = 2
+    client.placed.clear()
     skipped = await strategy.run(live_matches=[late])
     assert skipped["skipped_late_round"] == 2
     assert client.placed == []
+
+    # A final is recognized, so it is not "unknown", and the default filter
+    # only blocks semifinals.
+    final = _live_alcaraz()
+    final.round_name = "Final"
+    final.cup_round_type = 1
+    client.placed.clear()
+    final_stats = await TennisSet3Strategy(
+        client=client,
+        sofascore=FakeSofa([final]),
+        dry_run=False,
+        account_name="main",
+        journal=journal,
+        skip_rounds="semifinal",
+    ).run(live_matches=[final])
+    assert final_stats["skipped_late_round"] == 0
+    assert client.placed
+
+    # Kalshi title is enough when SofaScore has no round.
+    client.placed.clear()
+    titled = _alcaraz_event()
+    titled["title"] = "Semifinal"
+    for market in titled["markets"]:
+        market["title"] = "Semifinal"
+    client.events = [titled]
+    unknown_match = _live_alcaraz()
+    kalshi_skip = await TennisSet3Strategy(
+        client=client,
+        sofascore=FakeSofa([unknown_match]),
+        dry_run=False,
+        account_name="main",
+        journal=journal,
+    ).run(live_matches=[unknown_match])
+    assert kalshi_skip["skipped_late_round"] == 2
+    assert client.placed == []
+
+    # Unknown round is logged and still traded.
+    client.events = [_alcaraz_event()]
+    client.placed.clear()
+    blank = _live_alcaraz()
+    allowed = await TennisSet3Strategy(
+        client=client,
+        sofascore=FakeSofa([blank]),
+        dry_run=False,
+        account_name="main",
+        journal=journal,
+        skip_rounds="semifinal",
+    ).run(live_matches=[blank])
+    assert allowed["placed"] == 1
+    assert allowed["skipped_late_round"] == 0
+    rows = await journal.load_events(account="main")
+    assert any(row["decision"] == "allow" and row["details"] == "round_unknown" for row in rows)
+
+    # The filter can be turned off.
+    client.placed.clear()
+    forced = await TennisSet3Strategy(
+        client=client,
+        sofascore=FakeSofa([late]),
+        dry_run=False,
+        account_name="off",
+        skip_rounds="none",
+    ).run(live_matches=[late])
+    assert forced["skipped_late_round"] == 0
+    assert forced["placed"] == 1
     await journal.close()
 
 

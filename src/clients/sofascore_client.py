@@ -30,6 +30,7 @@ Be polite with request frequency — SofaScore will IP-block aggressive polling.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -153,46 +154,118 @@ def players_share_surname(name_a: str, name_b: str) -> bool:
 
 
 # SofaScore cupRoundType is the number of ties in a full knockout round.
-# 1 = final, 2 = semifinals. 230 is a qualifying final. Quarterfinals are 4.
-_LATE_CUP_ROUND_TYPES = {1, 2, 230}
-_SEMI_ROUND = re.compile(r"\bsemi[\s-]*finals?\b", re.IGNORECASE)
-_QUARTER_ROUND = re.compile(r"\bquarter[\s-]*finals?\b", re.IGNORECASE)
-_EXACT_FINAL = re.compile(r"(the\s+)?(grand\s+)?finals?", re.IGNORECASE)
-_FINAL_WORD = re.compile(r"\bfinal\b", re.IGNORECASE)
+_CUP_ROUND_KIND = {
+    1: "final",
+    2: "semifinal",
+    4: "quarterfinal",
+    8: "earlier",
+    16: "earlier",
+    32: "earlier",
+    64: "earlier",
+    230: "final",  # qualifying final
+}
+_ROUND_ALIASES = {
+    "sf": "semifinal",
+    "semifinal": "semifinal",
+    "semifinals": "semifinal",
+    "semi final": "semifinal",
+    "semi finals": "semifinal",
+    "final": "final",
+    "finals": "final",
+    "the final": "final",
+    "grand final": "final",
+    "qf": "quarterfinal",
+    "quarterfinal": "quarterfinal",
+    "quarterfinals": "quarterfinal",
+    "quarter final": "quarterfinal",
+    "quarter finals": "quarterfinal",
+}
 
 
-def round_label_is_late(label: str) -> bool:
-    """True when a round label is a semifinal or a final.
+def _normalize_round_text(label: str) -> str:
+    text = re.sub(r"[_\-]+", " ", str(label or ""))
+    return re.sub(r"\s+", " ", text).strip().lower()
 
-    Quarterfinals stay eligible. A tournament named "ATP Finals" is not itself
-    a final round; only a label that is the final, or that says semifinal, is.
+
+def classify_round_label(label: str) -> Optional[str]:
+    """Map a round name or slug to semifinal, final, quarterfinal, or earlier.
+
+    Returns None when the text is not a round we recognize. "ATP Finals" is a
+    tournament name, not the final round. "SF" and "semifinals" are semifinals.
     """
-    if not label:
-        return False
-    text = re.sub(r"[_]+", " ", str(label))
-    text = re.sub(r"\s+", " ", text).strip()
-    if _QUARTER_ROUND.search(text):
-        return False
-    if _SEMI_ROUND.search(text):
-        return True
-    if _EXACT_FINAL.fullmatch(text):
-        return True
-    lowered = text.lower()
-    if re.search(r"\b(atp|wta|nitto)\s+finals\b", lowered) and not _FINAL_WORD.search(
-        lowered.replace("finals", " ")
-    ):
-        return False
-    return _FINAL_WORD.search(text) is not None
+    text = _normalize_round_text(label)
+    if not text:
+        return None
+    if text in _ROUND_ALIASES:
+        return _ROUND_ALIASES[text]
+    if re.search(r"\bquarter\s*finals?\b", text):
+        return "quarterfinal"
+    if re.search(r"\bsemi\s*finals?\b", text) or re.search(r"(^|[\s:/])sf($|[\s:/])", text):
+        return "semifinal"
+    if re.fullmatch(r"(the |grand )?finals?", text):
+        return "final"
+    if re.search(r"\b(atp|wta|nitto)\s+finals\b", text):
+        return None
+    if re.search(r"\bfinal\b", text):
+        return "final"
+    if re.search(r"\bround of (16|32|64|128)\b", text) or re.search(r"\br(16|32|64|128)\b", text):
+        return "earlier"
+    if re.search(r"\b(round robin|group|qualification|qualifying|first round|second round)\b", text):
+        return "earlier"
+    return None
 
 
-def is_semifinal_or_later(round_name: str = "", cup_round_type=None) -> bool:
-    """True for semifinals, finals, and qualifying finals."""
+def cup_round_kind(cup_round_type) -> Optional[str]:
     try:
-        if cup_round_type is not None and int(cup_round_type) in _LATE_CUP_ROUND_TYPES:
-            return True
+        if cup_round_type is None or cup_round_type == "":
+            return None
+        return _CUP_ROUND_KIND.get(int(cup_round_type))
     except (TypeError, ValueError):
-        pass
-    return round_label_is_late(round_name)
+        return None
+
+
+def detect_round(
+    round_name: str = "",
+    round_slug: str = "",
+    cup_round_type=None,
+    extra_labels: Optional[List[str]] = None,
+) -> str:
+    """Return semifinal, final, quarterfinal, earlier, or unknown.
+
+    A recognized label or cup-round code wins. Empty metadata is unknown,
+    which the strategy logs and then allows.
+    """
+    kinds = []
+    cup_kind = cup_round_kind(cup_round_type)
+    if cup_kind:
+        kinds.append(cup_kind)
+    for label in (round_name, round_slug, *(extra_labels or [])):
+        kind = classify_round_label(label or "")
+        if kind:
+            kinds.append(kind)
+    for kind in ("semifinal", "final", "quarterfinal", "earlier"):
+        if kind in kinds:
+            return kind
+    return "unknown"
+
+
+def parse_skip_rounds(raw: Optional[str] = None) -> set:
+    """Rounds that must not be entered. Default is semifinal only.
+
+    ``none``, ``off``, or an empty string disables the filter. Commas separate
+    names: ``semifinal,final``.
+    """
+    if raw is None:
+        raw = os.environ.get("SKIP_ROUNDS", "semifinal")
+    text = (raw or "").strip().lower()
+    if text in {"", "none", "off", "false", "0"}:
+        return set()
+    selected = set()
+    for part in text.split(","):
+        key = _normalize_round_text(part).replace(" ", "")
+        spaced = _normalize_round_text(part)
+        selected.add(_ROUND_ALIASES.get(spaced) or _ROUND_ALIASES.get(key) or key)
+    return selected
 
 
 @dataclass
@@ -205,6 +278,7 @@ class LiveTennisMatch:
     status_type: str
     status_description: str
     round_name: str = ""
+    round_slug: str = ""
     cup_round_type: Optional[int] = None
     home_sets_won: int = 0
     away_sets_won: int = 0
@@ -485,7 +559,8 @@ class SofaScoreClient:
                     current_set=_current_set_number(ev),
                     status_type=status.get("type", ""),
                     status_description=status.get("description", ""),
-                    round_name=str(round_info.get("name") or round_info.get("slug") or ""),
+                    round_name=str(round_info.get("name") or ""),
+                    round_slug=str(round_info.get("slug") or ""),
                     cup_round_type=cup_type,
                     home_sets_won=_sets_won(ev, "homeScore", "awayScore"),
                     away_sets_won=_sets_won(ev, "awayScore", "homeScore"),

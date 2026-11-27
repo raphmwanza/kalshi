@@ -119,7 +119,7 @@ One deployment can run the tennis strategy on more than one Kalshi account. Each
 Set `KALSHI_ACCOUNTS` to a JSON list:
 
 ```json
-[{"name":"main","api_key_id":"KEY","private_key":"-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"}]
+[{"name":"main","api_key_id":"KEY","private_key":"<PEM body; use \\n between lines>"}]
 ```
 
 Or use numbered variables, starting at 1 with no gaps: `KALSHI_ACCOUNT_NAME_1`, `KALSHI_API_KEY_ID_1`, `KALSHI_PRIVATE_KEY_1`, then `_2`, and so on. `KALSHI_API_KEY_1` is an alias for the key id. If neither form is set, the single `KALSHI_API_KEY` / `KALSHI_PRIVATE_KEY` pair is account `default`.
@@ -152,7 +152,7 @@ Give that service a public domain. Optional health check path: `/healthz` (no jo
 
 If the service start command replaces the image entrypoint entirely, set it to `python -m src.journal.web`. If Railway passes the start command through the entrypoint, `dashboard` is enough. The page is read-only: open positions, recent decisions and trades, win rate, cumulative PnL (Chart.js), PnL by entry rule, and the last cycle time for each account. There are no trading controls.
 
-Semifinals and finals are not entered (SofaScore `cupRoundType` 1 or 2, or a round label of semifinal/final). Quarterfinals still qualify. A tournament named "ATP Finals" is not treated as the final round.
+Semifinals are not entered by default. The round comes from SofaScore `roundInfo` (`name`, `slug`, `cupRoundType` 2) or, if that is missing, from the Kalshi event title. Labels such as `Semifinal`, `Semi-final`, `SF`, and `semifinals` all count. `SKIP_ROUNDS=semifinal` is the default; set `SKIP_ROUNDS=semifinal,final` to also skip finals, or `SKIP_ROUNDS=none` to turn the filter off. Quarterfinals still qualify. If neither source identifies a round, the bot logs that the round is unknown and allows the entry. A tournament named "ATP Finals" is not treated as a semifinal.
 
 ---
 

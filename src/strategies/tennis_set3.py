@@ -63,10 +63,10 @@ from typing import Dict, List, Optional, Tuple
 from src.clients.sofascore_client import (
     LiveTennisMatch,
     SofaScoreClient,
-    is_semifinal_or_later,
+    detect_round,
     names_match,
+    parse_skip_rounds,
     players_share_surname,
-    round_label_is_late,
 )
 from src.utils.kalshi_fees import buy_debit_dollars, taker_fee_dollars
 from src.utils.market_prices import get_market_prices, is_tradeable_market
@@ -531,6 +531,7 @@ class TennisSet3Strategy:
         cash_reserve_tight_usd: float = CASH_RESERVE_TIGHT_USD,
         account_name: str = "default",
         journal=None,
+        skip_rounds: Optional[str] = None,
     ):
         self.client = client
         self.sofascore = sofascore or SofaScoreClient()
@@ -538,6 +539,8 @@ class TennisSet3Strategy:
         self.dry_run = dry_run
         self.account_name = account_name or "default"
         self.journal = journal
+        # None means read SKIP_ROUNDS, which defaults to semifinal.
+        self.skip_rounds = parse_skip_rounds(skip_rounds)
         self.min_win_probability = min_win_probability
         self.max_entry_price = max_entry_price
         self.min_set = min_set
@@ -843,16 +846,34 @@ class TennisSet3Strategy:
                 continue
             side = "yes"
             in_set3 = match.current_set >= self.min_set
-            if self._is_late_round(match, market):
-                stats["skipped_late_round"] += 1
+            round_kind = self._detected_round(match, market)
+            if round_kind == "unknown":
+                logger.info(
+                    "%s: round is unknown (no SofaScore roundInfo and no Kalshi round label); allowing entry",
+                    ticker,
+                )
                 print(
-                    f"  ⏭️  {ticker}: {match.round_name or 'semifinal or later'} "
-                    f"— skip semifinal and above",
+                    f"  ℹ️  {ticker}: round unknown — allowing entry",
                     flush=True,
                 )
                 await self._log_signal(
-                    ticker, "late_round", player, side, yes_ask, 0, match,
-                    "skip", "semifinal_or_later",
+                    ticker, "unknown_round", player, side, yes_ask, 0, match,
+                    "allow", "round_unknown",
+                )
+            elif round_kind in self.skip_rounds:
+                stats["skipped_late_round"] += 1
+                logger.info(
+                    "%s: skipping %s (SKIP_ROUNDS=%s)",
+                    ticker, round_kind, ",".join(sorted(self.skip_rounds)) or "none",
+                )
+                print(
+                    f"  ⏭️  {ticker}: {match.round_name or match.round_slug or round_kind} "
+                    f"— skip {round_kind}",
+                    flush=True,
+                )
+                await self._log_signal(
+                    ticker, round_kind, player, side, yes_ask, 0, match,
+                    "skip", f"round:{round_kind}",
                 )
                 continue
 
@@ -1004,7 +1025,7 @@ class TennisSet3Strategy:
         print(f"  Underdog candidates: {stats['underdog_candidates']}", flush=True)
         print(f"  Skipped (upset avoid):{stats['skipped_upset_avoid']}", flush=True)
         print(f"  Skipped (not started):{stats['skipped_not_started']}", flush=True)
-        print(f"  Skipped (SF/final):  {stats.get('skipped_late_round', 0)}", flush=True)
+        print(f"  Skipped (round):     {stats.get('skipped_late_round', 0)}", flush=True)
         print(f"  Orders placed:       {stats['placed']}", flush=True)
         print(f"  Instantly filled:    {stats['filled']}", flush=True)
         print(f"  Skipped (existing):  {stats['skipped_existing']}", flush=True)
@@ -1209,21 +1230,24 @@ class TennisSet3Strategy:
             return f"set {m.current_set} tied (need up by {self.min_game_lead})"
         return f"set {m.current_set} lead is only {lead} (need {self.min_game_lead})"
 
-    def _is_late_round(self, match: LiveTennisMatch, market: Dict) -> bool:
-        """Semifinals and finals are skipped. Quarterfinals are not."""
-        if is_semifinal_or_later(
-            getattr(match, "round_name", "") or "",
-            getattr(match, "cup_round_type", None),
-        ):
-            return True
-        for label in (
-            market.get("_event_title"),
-            market.get("title"),
-            market.get("subtitle"),
-        ):
-            if label and round_label_is_late(str(label)):
-                return True
-        return False
+    def _detected_round(self, match: LiveTennisMatch, market: Dict) -> str:
+        """Semifinal, final, quarterfinal, earlier, or unknown.
+
+        SofaScore roundInfo name, slug, and cupRoundType are checked first.
+        Kalshi title, subtitle, and event title are the fallback. Unknown
+        means none of those identified a round.
+        """
+        labels = []
+        for key in ("_event_title", "title", "subtitle", "event_ticker"):
+            value = market.get(key)
+            if value:
+                labels.append(str(value))
+        return detect_round(
+            round_name=getattr(match, "round_name", "") or "",
+            round_slug=getattr(match, "round_slug", "") or "",
+            cup_round_type=getattr(match, "cup_round_type", None),
+            extra_labels=labels,
+        )
 
     async def _journal(self, **fields) -> None:
         """Best-effort journal write. A logging failure must not stop trading."""
