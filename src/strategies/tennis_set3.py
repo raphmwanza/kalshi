@@ -61,6 +61,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from src.clients.sofascore_client import (
+    entry_matches,
     LiveTennisMatch,
     SofaScoreClient,
     detect_round,
@@ -684,10 +685,20 @@ class TennisSet3Strategy:
         #    set 3+, OR a player won set 1 and is currently leading set 2
         #    (on track for a straight-sets win that never reaches set 3).
         if live_matches is None:
-            print("📡 Fetching live tennis matches from SofaScore...", flush=True)
+            print("📡 Fetching live tennis matches...", flush=True)
             live_matches = await self.sofascore.get_live_tennis_matches()
         else:
-            print("📡 Using the shared SofaScore snapshot for this cycle...", flush=True)
+            print("📡 Using the shared live-score snapshot for this cycle...", flush=True)
+        if getattr(self.sofascore, "last_fetch_blocked", False):
+            print(
+                "  Live scores unavailable. Skipping new entries "
+                "(no stale or missing scores).",
+                flush=True,
+            )
+        live_matches = entry_matches(
+            live_matches,
+            blocked=bool(getattr(self.sofascore, "last_fetch_blocked", False)),
+        )
         stats["live_matches"] = len(live_matches)
         actionable_matches = [m for m in live_matches if self._match_actionable(m)]
         stats["actionable_matches"] = len(actionable_matches)
