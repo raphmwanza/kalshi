@@ -112,6 +112,8 @@ Set these on the service:
 
 `KALSHI_PRIVATE_KEY_PATH` is unnecessary when `KALSHI_PRIVATE_KEY` is set. Do not commit the PEM. To use only accounts pasted in the dashboard, leave both key variables empty and set `KEYS_ENCRYPTION_KEY` and `DATABASE_URL` on this service as well as on the dashboard.
 
+Live set scores come from SofaScore (Chrome TLS impersonation, with `Origin` and `Referer` of `https://www.sofascore.com`). Set `SOFASCORE_PROXY_URL` when Railway's IP is challenged. If SofaScore fails, the cycle uses ESPN's public ATP and WTA scoreboards. If both fail, the cycle logs that and does not open new trades from a missing or leftover score list.
+
 ### Several accounts
 
 One deployment can run the tennis strategy on more than one Kalshi account. Each account has its own client, bankroll, position cap, and journal tag. SofaScore is fetched once per cycle and shared. If one account errors, the others still run.

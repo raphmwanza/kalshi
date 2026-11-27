@@ -53,16 +53,26 @@ _NOT_LIVE_HINTS = (
     "walkover", "delay", "abandon", "await", "pause",
 )
 
-# Browser profile curl_cffi impersonates (TLS + HTTP2 + header order).
+# Browser profile curl_cffi impersonates (TLS + HTTP2 fingerprint).
 _IMPERSONATE = "chrome"
 
-# Extra headers to look like a fetch from the SofaScore web app.
+# A browser fetch from the SofaScore site. The User-Agent matches the
+# impersonated Chrome; Cloudflare rejects a fingerprint that disagrees with it.
 _DEFAULT_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.sofascore.com/",
     "Origin": "https://www.sofascore.com",
+    "Referer": "https://www.sofascore.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
 }
+
+ESPN_SCOREBOARDS = (
+    "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard",
+    "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard",
+)
 
 _TOKEN_RE = re.compile(r"[^a-z]+")
 
@@ -491,6 +501,46 @@ def _parse_ranking(raw) -> Optional[int]:
     return rank if rank > 0 else None
 
 
+def _matches_from_sofascore(data) -> List[LiveTennisMatch]:
+    events = data.get("events", []) if isinstance(data, dict) else []
+    matches: List[LiveTennisMatch] = []
+    for ev in events:
+        try:
+            home_team = ev.get("homeTeam") or {}
+            away_team = ev.get("awayTeam") or {}
+            home = home_team.get("name", "") or ""
+            away = away_team.get("name", "") or ""
+            status = ev.get("status") or {}
+            round_info = ev.get("roundInfo") or {}
+            cup_type = round_info.get("cupRoundType")
+            try:
+                cup_type = int(cup_type) if cup_type is not None else None
+            except (TypeError, ValueError):
+                cup_type = None
+            if not home or not away:
+                continue
+            matches.append(LiveTennisMatch(
+                home_name=home,
+                away_name=away,
+                current_set=_current_set_number(ev),
+                status_type=status.get("type", ""),
+                status_description=status.get("description", ""),
+                round_name=str(round_info.get("name") or ""),
+                round_slug=str(round_info.get("slug") or ""),
+                cup_round_type=cup_type,
+                home_sets_won=_sets_won(ev, "homeScore", "awayScore"),
+                away_sets_won=_sets_won(ev, "awayScore", "homeScore"),
+                home_ranking=_parse_ranking(home_team.get("ranking")),
+                away_ranking=_parse_ranking(away_team.get("ranking")),
+                home_score=ev.get("homeScore") or {},
+                away_score=ev.get("awayScore") or {},
+                raw=ev,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Skipping malformed SofaScore event: %s", exc)
+    return matches
+
+
 def _sets_won(event: Dict, score_key: str, opp_key: str) -> int:
     """Count sets a player has won (their period score strictly higher)."""
     score = event.get(score_key) or {}
@@ -510,6 +560,28 @@ def _sets_won(event: Dict, score_key: str, opp_key: str) -> int:
     return won
 
 
+def sofascore_proxy_url() -> str:
+    """Optional HTTP proxy for SofaScore only. Never logged (it may hold a password)."""
+    return os.environ.get("SOFASCORE_PROXY_URL", "").strip()
+
+
+def entry_matches(matches: Optional[List[LiveTennisMatch]], *, blocked: bool) -> List[LiveTennisMatch]:
+    """Matches that may be used for new entries.
+
+    A failed score fetch must not fall back to a list from an earlier cycle.
+    """
+    if blocked:
+        return []
+    return list(matches or [])
+
+
+def _public_error(exc: BaseException) -> str:
+    text = str(exc)
+    if "@" in text or "proxy" in text.lower() or "SOFASCORE_PROXY" in text:
+        return type(exc).__name__
+    return text[:300]
+
+
 class SofaScoreClient:
     """Minimal async client for SofaScore live tennis data (via curl_cffi)."""
 
@@ -517,80 +589,91 @@ class SofaScoreClient:
         self.timeout = timeout
         self._owns_session = session is None
         self.session = session or AsyncSession()
-        # Set when the live feed is blocked, rate-limited, or unreachable so
-        # the trading loop can back off instead of polling again immediately.
+        # Set when every live-score source failed, so the loop backs off and
+        # does not open trades from a missing or leftover score list.
         self.last_fetch_blocked = False
+        self.score_source = ""
 
     async def get_live_tennis_matches(self) -> List[LiveTennisMatch]:
-        """Fetch all in-progress live tennis matches.
+        """Fetch in-progress tennis matches.
 
-        Returns an empty list on any network/parse error so a caller can
-        degrade gracefully rather than crash the trading loop. A block or
-        transport failure sets ``last_fetch_blocked`` so the caller backs off.
-        An HTTP 200 with no events is a quiet slate, not a block.
+        SofaScore is tried first. A 200 with no events is an empty slate, not
+        a failure. A block or transport error falls through to ESPN's public
+        scoreboard. If that also fails, the result is empty and
+        ``last_fetch_blocked`` is set so callers skip new entries.
         """
         self.last_fetch_blocked = False
-        try:
-            resp = await self.session.get(
-                SOFASCORE_LIVE_TENNIS_URL,
-                headers=_DEFAULT_HEADERS,
-                impersonate=_IMPERSONATE,
-                timeout=self.timeout,
+        self.score_source = ""
+        matches, ok = await self._load_sofascore()
+        if ok:
+            self.score_source = "sofascore"
+            logger.info("SofaScore: %d live tennis matches fetched", len(matches))
+            return matches
+        espn_matches, espn_ok = await self._load_espn()
+        if espn_ok:
+            self.score_source = "espn"
+            logger.warning(
+                "SofaScore live fetch failed; using ESPN scoreboard (%d in-progress matches)",
+                len(espn_matches),
             )
+            return espn_matches
+        self.last_fetch_blocked = True
+        logger.error(
+            "Live scores unavailable: SofaScore and ESPN both failed. "
+            "No new entries this cycle."
+        )
+        return []
+
+    async def _load_sofascore(self) -> tuple:
+        proxy = sofascore_proxy_url()
+        kwargs = {
+            "headers": _DEFAULT_HEADERS,
+            "impersonate": _IMPERSONATE,
+            "timeout": self.timeout,
+        }
+        if proxy:
+            kwargs["proxy"] = proxy
+            logger.info("SofaScore request is using SOFASCORE_PROXY_URL")
+        try:
+            resp = await self.session.get(SOFASCORE_LIVE_TENNIS_URL, **kwargs)
             status = getattr(resp, "status_code", None)
             if status in (403, 429, 503):
-                self.last_fetch_blocked = True
                 logger.warning(
                     "SofaScore live fetch blocked or rate-limited: HTTP %s", status
                 )
-                return []
+                return [], False
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:  # noqa: BLE001 - never let SofaScore kill the loop
-            self.last_fetch_blocked = True
-            logger.warning("SofaScore live fetch failed: %s", exc)
-            return []
+            logger.warning("SofaScore live fetch failed: %s", _public_error(exc))
+            return [], False
+        return _matches_from_sofascore(data), True
 
-        events = data.get("events", []) if isinstance(data, dict) else []
-        matches: List[LiveTennisMatch] = []
-        for ev in events:
+    async def _load_espn(self) -> tuple:
+        from src.clients.espn_tennis import matches_from_espn_scoreboard
+
+        collected: List[LiveTennisMatch] = []
+        any_ok = False
+        for url in ESPN_SCOREBOARDS:
             try:
-                home_team = ev.get("homeTeam") or {}
-                away_team = ev.get("awayTeam") or {}
-                home = home_team.get("name", "") or ""
-                away = away_team.get("name", "") or ""
-                status = ev.get("status") or {}
-                round_info = ev.get("roundInfo") or {}
-                cup_type = round_info.get("cupRoundType")
-                try:
-                    cup_type = int(cup_type) if cup_type is not None else None
-                except (TypeError, ValueError):
-                    cup_type = None
-                match = LiveTennisMatch(
-                    home_name=home,
-                    away_name=away,
-                    current_set=_current_set_number(ev),
-                    status_type=status.get("type", ""),
-                    status_description=status.get("description", ""),
-                    round_name=str(round_info.get("name") or ""),
-                    round_slug=str(round_info.get("slug") or ""),
-                    cup_round_type=cup_type,
-                    home_sets_won=_sets_won(ev, "homeScore", "awayScore"),
-                    away_sets_won=_sets_won(ev, "awayScore", "homeScore"),
-                    home_ranking=_parse_ranking(home_team.get("ranking")),
-                    away_ranking=_parse_ranking(away_team.get("ranking")),
-                    home_score=ev.get("homeScore") or {},
-                    away_score=ev.get("awayScore") or {},
-                    raw=ev,
+                resp = await self.session.get(
+                    url,
+                    headers={"Accept": "application/json"},
+                    timeout=self.timeout,
                 )
-                if home and away:
-                    matches.append(match)
+                status = getattr(resp, "status_code", None)
+                if status != 200:
+                    logger.warning("ESPN scoreboard HTTP %s", status)
+                    continue
+                payload = resp.json()
+                if not isinstance(payload, dict):
+                    logger.warning("ESPN scoreboard returned a non-object body")
+                    continue
+                any_ok = True
+                collected.extend(matches_from_espn_scoreboard(payload))
             except Exception as exc:  # noqa: BLE001
-                logger.debug("Skipping malformed SofaScore event: %s", exc)
-                continue
-
-        logger.info("SofaScore: %d live tennis matches fetched", len(matches))
-        return matches
+                logger.warning("ESPN scoreboard failed: %s", _public_error(exc))
+        return collected, any_ok
 
     async def find_match_for_player(self, player_name: str) -> Optional[LiveTennisMatch]:
         """Return the live match involving ``player_name``, if any."""
