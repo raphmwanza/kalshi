@@ -423,3 +423,47 @@ async def test_dashboard_is_read_only_and_password_protected(monkeypatch):
     assert "Last cycle" in body
     assert "chart.js" in body.lower()
     assert client.post("/orders").status_code == 405
+
+
+class _DeadThenLive:
+    """First statement hits a closed socket; the replacement connection works."""
+
+    def __init__(self):
+        self.executed = 0
+        self.dead = True
+
+    async def execute(self, sql, *args):
+        self.executed += 1
+        if self.dead:
+            raise ConnectionError("connection is closed")
+        return "INSERT 0 1"
+
+    async def close(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_postgres_journal_reconnects_after_a_dropped_socket():
+    from src.journal.tennis_log import PostgresJournal
+
+    journal = PostgresJournal("postgresql://example.invalid/kalshi")
+    first = _DeadThenLive()
+    second = _DeadThenLive()
+    second.dead = False
+    opened = []
+
+    async def open_stub():
+        journal._conn = first if not opened else second
+        opened.append(1)
+
+    journal.open = open_stub
+    await journal.record({
+        "ts": "2026-01-01T00:00:00+00:00",
+        "account": "main",
+        "kind": "cycle",
+        "order_status": "ok",
+        "dedupe_key": "cycle:main:1",
+    })
+    assert len(opened) == 2
+    assert first.executed == 1
+    assert second.executed == 1
