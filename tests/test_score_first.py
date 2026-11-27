@@ -83,6 +83,38 @@ async def test_actionable_match_fetches_balance_and_market_not_positions():
 
 
 @pytest.mark.asyncio
+async def test_second_cycle_with_no_matches_makes_no_kalshi_calls():
+    from src.clients.accounts import KalshiAccount
+    from src.strategies.tennis_runner import _SESSIONS, reset_account_sessions, run_tennis_accounts
+
+    reset_account_sessions()
+    client = FakeKalshi()
+    created = {"n": 0}
+
+    def factory(account):
+        created["n"] += 1
+        return client
+
+    account = KalshiAccount(name="Raph_Kalshi", api_key="k" * 36, private_key="pem-body")
+    sofa = FakeSofa([])
+    first = await run_tennis_accounts(
+        [account], sofascore=sofa, client_factory=factory, matches=[],
+    )
+    assert created["n"] == 1
+    assert first["by_account"]["Raph_Kalshi"]["kalshi_calls"] == 4
+    session = next(iter(_SESSIONS.values()))
+    calls_after_sync = len(session.client.calls)
+
+    second = await run_tennis_accounts(
+        [account], sofascore=sofa, client_factory=factory, matches=[],
+    )
+    assert created["n"] == 1
+    assert second["by_account"]["Raph_Kalshi"]["kalshi_calls"] == 0
+    assert len(session.client.calls) == calls_after_sync
+    reset_account_sessions()
+
+
+@pytest.mark.asyncio
 async def test_resting_99c_sell_is_replaced_with_94c():
     assert SELL_ALL_AT == 0.94
     client = FakeKalshi()
