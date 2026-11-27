@@ -365,6 +365,12 @@ async def test_strategy_logs_entries_and_skips_semifinals(tmp_path, monkeypatch)
     await journal.close()
 
 
+def _csrf(page: str) -> str:
+    marker = 'name="csrf_token" value="'
+    start = page.index(marker) + len(marker)
+    return page[start:page.index('"', start)]
+
+
 @pytest.mark.asyncio
 async def test_dashboard_is_read_only_and_password_protected(monkeypatch):
     from fastapi.testclient import TestClient
@@ -391,20 +397,29 @@ async def test_dashboard_is_read_only_and_password_protected(monkeypatch):
         ]
 
     monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    monkeypatch.setenv("DASHBOARD_COOKIE_SECURE", "false")
     client = TestClient(create_app(load_events))
     assert client.get("/healthz").status_code == 200
     assert client.get("/healthz").json() == {"ok": True}
     assert client.get("/").status_code == 503
 
     monkeypatch.setenv("DASHBOARD_PASSWORD", "s3cret")
-    assert client.get("/").status_code == 401
-    assert client.get("/", auth=("dashboard", "nope")).status_code == 401
-    page = client.get("/", auth=("dashboard", "s3cret"))
+    client = TestClient(create_app(load_events))
+    assert client.get("/", follow_redirects=False).status_code == 303
+    login = client.get("/login")
+    assert login.status_code == 200
+    token = _csrf(login.text)
+    wrong = client.post("/login", data={"password": "nope", "csrf_token": token})
+    assert wrong.status_code == 401
+    token = _csrf(wrong.text)
+    client.post("/login", data={"password": "s3cret", "csrf_token": token})
+    page = client.get("/")
     assert page.status_code == 200
     body = page.text
     assert "Read-only" in body
-    assert "<form" not in body.lower()
+    assert 'action="/logout"' in body
+    assert 'action="/orders"' not in body
     assert "set3_favorite" in body
     assert "Last cycle" in body
     assert "chart.js" in body.lower()
-    assert client.post("/orders", auth=("dashboard", "s3cret")).status_code == 405
+    assert client.post("/orders").status_code == 405

@@ -240,14 +240,16 @@ def _run_tennis(
             f"(requested {interval}s). Ctrl-C to stop."
         )
 
-    from src.clients.accounts import load_kalshi_accounts
+    from src.journal.account_store import load_cycle_accounts
     from src.journal.tennis_log import open_journal
     from src.strategies.tennis_runner import run_tennis_accounts
 
-    accounts = load_kalshi_accounts()
-    print(f"   Accounts: {', '.join(account.name for account in accounts)}")
+    print("   Accounts reload from the environment and the database each cycle.")
 
     async def _run_once(journal):
+        accounts = await load_cycle_accounts()
+        names = ", ".join(account.name for account in accounts) or "(none)"
+        print(f"   Accounts this cycle: {names}")
         sofascore = SofaScoreClient()
         try:
             return await run_tennis_accounts(
@@ -342,11 +344,13 @@ def cmd_tennis_report(args: argparse.Namespace) -> None:
 
 
 def cmd_tennis_dashboard(args: argparse.Namespace) -> None:
-    """Serve the read-only tennis journal. Listens on $PORT when BOT_MODE=dashboard."""
+    """Serve the tennis journal. Listens on $PORT when BOT_MODE=dashboard."""
     from src.journal.web import main
 
     os.environ["DASHBOARD_HOST"] = args.host
     os.environ["PORT"] = str(args.port)
+    if args.host in {"127.0.0.1", "localhost", "::1"} and "DASHBOARD_COOKIE_SECURE" not in os.environ:
+        os.environ["DASHBOARD_COOKIE_SECURE"] = "false"
     main()
 
 

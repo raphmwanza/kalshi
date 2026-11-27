@@ -11,7 +11,7 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from src.clients.accounts import KalshiAccount
+from src.clients.accounts import KalshiAccount, account_is_live, redact_key_material
 from src.clients.kalshi_client import KalshiClient
 from src.strategies.tennis_set3 import TennisSet3Strategy
 
@@ -60,14 +60,16 @@ async def run_tennis_accounts(
 
     for account in accounts:
         combined["accounts"] += 1
-        print(f"\n👤 Account {account.name}", flush=True)
+        account_live = account_is_live(account, live)
+        mode = "live" if account_live else "dry run"
+        print(f"\n👤 Account {account.name} ({mode})", flush=True)
         client = None
         try:
             client = client_factory(account)
             strategy = TennisSet3Strategy(
                 client=client,
                 sofascore=sofascore,
-                dry_run=not live,
+                dry_run=not account_live,
                 account_name=account.name,
                 journal=journal,
             )
@@ -81,9 +83,10 @@ async def run_tennis_accounts(
             combined["account_errors"] += 1
             combined["errors"] += 1
             combined["needs_backoff"] = True
-            combined["by_account"][account.name] = {"error": str(exc), "needs_backoff": True}
-            logger.error("Account %s failed; continuing with the others: %s", account.name, exc)
-            print(f"  ❌ Account {account.name} failed: {exc}. Continuing.", flush=True)
+            safe_error = redact_key_material(str(exc))
+            combined["by_account"][account.name] = {"error": safe_error, "needs_backoff": True}
+            logger.error("Account %s failed; continuing with the others: %s", account.name, safe_error)
+            print(f"  ❌ Account {account.name} failed: {safe_error}. Continuing.", flush=True)
         finally:
             if client is not None:
                 try:

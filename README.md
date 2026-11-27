@@ -100,8 +100,8 @@ Set these on the service:
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `KALSHI_API_KEY` | yes | Kalshi API key ID |
-| `KALSHI_PRIVATE_KEY` | yes | Full PEM. Real newlines or a single line with `\n` both work; a surrounding pair of quotes is stripped |
+| `KALSHI_API_KEY` | unless using dashboard accounts | Kalshi API key ID |
+| `KALSHI_PRIVATE_KEY` | unless using dashboard accounts | Full PEM. Real newlines or a single line with `\n` both work; a surrounding pair of quotes is stripped |
 | `BOT_STRATEGY` | no | `tennis` (default), `safe-compounder`, or `directional` |
 | `BOT_LIVE` | no | `true` places real orders |
 | `BOT_LOOP` | no | `true` (default) keeps cycling |
@@ -110,7 +110,7 @@ Set these on the service:
 | `ENABLE_FILE_LOGGING` | no | Set `false` on Railway. Logs always go to stdout, which Railway collects |
 | `KALSHI_BASE_URL` | no | Leave unset unless you mean to override the production host |
 
-`KALSHI_PRIVATE_KEY_PATH` is unnecessary when `KALSHI_PRIVATE_KEY` is set. Do not commit the PEM.
+`KALSHI_PRIVATE_KEY_PATH` is unnecessary when `KALSHI_PRIVATE_KEY` is set. Do not commit the PEM. To use only accounts pasted in the dashboard, leave both key variables empty and set `KEYS_ENCRYPTION_KEY` and `DATABASE_URL` on this service as well as on the dashboard.
 
 ### Several accounts
 
@@ -123,6 +123,8 @@ Set `KALSHI_ACCOUNTS` to a JSON list:
 ```
 
 Or use numbered variables, starting at 1 with no gaps: `KALSHI_ACCOUNT_NAME_1`, `KALSHI_API_KEY_ID_1`, `KALSHI_PRIVATE_KEY_1`, then `_2`, and so on. `KALSHI_API_KEY_1` is an alias for the key id. If neither form is set, the single `KALSHI_API_KEY` / `KALSHI_PRIVATE_KEY` pair is account `default`.
+
+Accounts can also be pasted on the dashboard Accounts page. Those are stored encrypted in Postgres and loaded, if enabled, on every cycle in addition to the environment accounts. See the dashboard section below. A stored account whose name matches an environment account is skipped so the same key is not traded twice.
 
 ### Journal, report, dashboard
 
@@ -143,14 +145,25 @@ Add a second service in the same Railway project from this repo. Leave the tradi
 | Variable | Required | Meaning |
 |---|---|---|
 | `BOT_MODE` | yes | `dashboard`. The image entrypoint then runs `python -m src.journal.web` and does not look for a Kalshi key |
-| `DATABASE_URL` | yes | The same Postgres URL the worker writes. Add it as a variable reference to the Postgres plugin |
-| `DASHBOARD_PASSWORD` | yes | Password for HTTP basic auth. The page refuses to serve journal data when this is empty |
-| `DASHBOARD_USER` | no | Basic-auth username. Default `dashboard` |
+| `DATABASE_URL` | yes | The same Postgres URL the worker uses. Add it as a variable reference to the Postgres plugin |
+| `DASHBOARD_PASSWORD` | yes | Login password. The process refuses to serve the journal or accounts when this is empty |
+| `KEYS_ENCRYPTION_KEY` | for Accounts | Fernet key. Required on this service and on the worker, with the same value. Without it, key storage does not start |
+| `DASHBOARD_COOKIE_SECURE` | no | Default `true` (Secure session cookie). The local `tennis-dashboard` command turns it off for localhost HTTP |
 | `PORT` | automatic | Railway sets this. The server binds `0.0.0.0:$PORT` |
+
+Generate the encryption key locally and paste it into Railway. Do not commit it:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
 
 Give that service a public domain. Optional health check path: `/healthz` (no journal data, no password). Do not set `BOT_MODE=dashboard` on the trading service.
 
-If the service start command replaces the image entrypoint entirely, set it to `python -m src.journal.web`. If Railway passes the start command through the entrypoint, `dashboard` is enough. The page is read-only: open positions, recent decisions and trades, win rate, cumulative PnL (Chart.js), PnL by entry rule, and the last cycle time for each account. There are no trading controls.
+If the service start command replaces the image entrypoint entirely, set it to `python -m src.journal.web`. If Railway passes the start command through the entrypoint, `dashboard` is enough. The journal page shows open positions, recent decisions and trades, win rate, cumulative PnL (Chart.js), PnL by entry rule, and the last cycle time for each account. It cannot place orders.
+
+Login is a password form. The session cookie is HttpOnly, SameSite=Strict, and Secure in production. Every form includes a CSRF token. After 8 failed logins from the same address within 10 minutes, further attempts are rejected for that window.
+
+The Accounts page (same login) accepts a name, an API key ID, and a private key PEM. The private key is encrypted with `KEYS_ENCRYPTION_KEY` and written to Postgres. The page then shows the key ID and the last four characters of the key body, never the PEM, and the process does not log the key. Buttons on that page enable or disable the account, switch it between dry run and live, test the connection (a read-only balance call), and delete it. New accounts default to dry run. A stored account places real orders only when its toggle is Live and the worker is running with `BOT_LIVE=true`. The worker reads enabled stored accounts on every cycle, so saving a key does not require a redeploy. Set `KEYS_ENCRYPTION_KEY` and `DATABASE_URL` on the worker too. With both set, the worker can start with no `KALSHI_PRIVATE_KEY`; it uses the enabled dashboard accounts. If the encryption key is missing, the worker keeps trading the environment accounts and skips the database keys. A stored account whose name matches an environment account is skipped.
 
 Semifinals and finals are not entered by default (`SKIP_ROUNDS=semifinal,final`). That is semifinal and above: semifinals, the final, and a championship or title match. The round comes from SofaScore `roundInfo` (`name`, `slug`, `cupRoundType` 1 for a final and 2 for a semifinal) or, if that is missing, from the Kalshi event title. `Semifinal`, `Semi-final`, `SF`, `semifinals`, `Final`, and `Championship` all count. `Quarterfinal` and `Quarter-final` do not: the word final inside them is not the final. Set `SKIP_ROUNDS=none` to turn the filter off. If neither source identifies a round, the bot logs that the round is unknown and allows the entry. A tournament named "ATP Finals" is not treated as the final round.
 

@@ -114,8 +114,8 @@ def _account_sections(summary: Dict, events: List[dict]) -> str:
     return "".join(blocks)
 
 
-def render_dashboard(summary: Dict, events: List[dict]) -> str:
-    """Read-only page. No forms and no trading controls."""
+def render_dashboard(summary: Dict, events: List[dict], csrf_token: str = "") -> str:
+    """Journal page. No order forms. Logout is a separate POST when a session exists."""
     accounts = summary.get("accounts") or {}
     chart = {
         name: [
@@ -126,6 +126,14 @@ def render_dashboard(summary: Dict, events: List[dict]) -> str:
     }
     payload = json.dumps(chart).replace("<", "\\u003c")
     edge = summary.get("implied_edge")
+    nav = '<p><a href="/">Journal</a> · <a href="/accounts">Accounts</a></p>'
+    logout = ""
+    if csrf_token:
+        logout = (
+            '<form method="post" action="/logout">'
+            f'<input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">'
+            "<button type=\"submit\">Log out</button></form>"
+        )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -149,6 +157,8 @@ def render_dashboard(summary: Dict, events: List[dict]) -> str:
 </head>
 <body>
 <h1>Tennis journal</h1>
+{nav}
+{logout}
 <p>Read-only. This page cannot place, cancel, or change orders.</p>
 <p>Overall settled edge {_pct(edge)} · realized PnL {_money(summary.get('total_pnl'))} · win rate {_pct(summary.get('win_rate'))}.</p>
 {_account_sections(summary, events)}
