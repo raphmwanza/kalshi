@@ -153,6 +153,16 @@ async def test_cycle_uses_only_stored_accounts_when_env_is_unset(monkeypatch, da
 
 
 @pytest.mark.asyncio
+async def test_image_default_key_path_is_not_a_second_account(monkeypatch, dashboard_env):
+    """Docker sets KALSHI_PRIVATE_KEY_PATH even when the file was never provided."""
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", "/app/kalshi_private_key.pem")
+    store = MemoryAccountStore(Fernet(Fernet.generate_key()))
+    await store.add_account("Raph_Kalshi", "k" * 36, _pem())
+    accounts = await load_cycle_accounts(open_store=lambda: store)
+    assert [account.name for account in accounts] == ["Raph_Kalshi"]
+
+
+@pytest.mark.asyncio
 async def test_cycle_skips_db_when_encryption_key_is_missing(monkeypatch, dashboard_env, caplog):
     caplog.set_level(logging.INFO)
     reset_store_notice()

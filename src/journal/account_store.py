@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives import serialization
 
 from src.clients.accounts import (
     KalshiAccount,
+    env_has_explicit_api_key,
     is_unconfigured_default,
     load_kalshi_accounts,
     merge_accounts,
@@ -414,9 +415,19 @@ async def load_cycle_accounts(
         return env_accounts
     finally:
         await store.close()
-    # No env keys: drop the empty "default" placeholder so a dashboard-only
-    # account is not paired with a failing file-key client every cycle.
-    if stored and all(is_unconfigured_default(account) for account in env_accounts):
+    # The image sets KALSHI_PRIVATE_KEY_PATH even when no key file exists.
+    # That path-only "default" account is not a configured env account. Drop
+    # it when the dashboard already supplied accounts and no API key id is set.
+    if stored and not env_has_explicit_api_key():
+        env_accounts = [
+            account
+            for account in env_accounts
+            if account.api_key.strip() or account.private_key.strip()
+        ]
+        env_accounts = [
+            account for account in env_accounts if not is_unconfigured_default(account)
+        ]
+    elif stored and all(is_unconfigured_default(account) for account in env_accounts):
         env_accounts = []
     return merge_accounts(env_accounts, stored)
 
