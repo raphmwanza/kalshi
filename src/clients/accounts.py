@@ -14,10 +14,14 @@ key keeps working.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
+from typing import List, Optional
 
 from src.clients.private_key import normalize_pem_env
+
+logger = logging.getLogger(__name__)
 
 
 class AccountConfigError(ValueError):
@@ -30,6 +34,9 @@ class KalshiAccount:
     api_key: str = ""
     private_key: str = ""
     private_key_path: str = ""
+    # None follows the process live flag (env accounts). False is dry run.
+    # True may place real orders only when the process itself is live.
+    live: Optional[bool] = None
 
 
 def _pem(value: str) -> str:
@@ -115,6 +122,58 @@ def _from_single() -> list[KalshiAccount]:
         private_key=_pem(private_key),
         private_key_path=private_key_path,
     )]
+
+
+def redact_key_material(text: str) -> str:
+    """Drop exception text that contains a PEM header."""
+    if "-----BEGIN" in text or "-----END" in text:
+        return "account key error"
+    return text
+
+
+def account_is_live(account: KalshiAccount, process_live: bool) -> bool:
+    """Whether this account may place real orders this cycle.
+
+    A dry-run worker stays dry for every account. Env accounts follow the
+    process flag. A stored account stays on dry run unless its own toggle is
+    on, so a key pasted in the dashboard does not trade until that toggle
+    is switched and the worker is live.
+    """
+    if not process_live:
+        return False
+    if account.live is None:
+        return True
+    return bool(account.live)
+
+
+def is_unconfigured_default(account: KalshiAccount) -> bool:
+    """True for the placeholder returned when no account env vars are set."""
+    return (
+        account.name == "default"
+        and not account.api_key
+        and not account.private_key
+        and not account.private_key_path
+        and account.live is None
+    )
+
+
+def merge_accounts(
+    env_accounts: List[KalshiAccount],
+    stored_accounts: List[KalshiAccount],
+) -> List[KalshiAccount]:
+    """Env accounts first. A stored account with the same name is skipped."""
+    merged: List[KalshiAccount] = []
+    seen = set()
+    for account in list(env_accounts) + list(stored_accounts):
+        if account.name in seen:
+            logger.warning(
+                "Skipping duplicate Kalshi account name %s; the environment account is kept",
+                account.name,
+            )
+            continue
+        seen.add(account.name)
+        merged.append(account)
+    return merged
 
 
 def load_kalshi_accounts() -> list[KalshiAccount]:

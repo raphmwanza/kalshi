@@ -60,6 +60,7 @@ dependencies = [
     "sentry-sdk==1.39.2",
     "xai_sdk>=1.0.0",
     "fastapi==0.115.6",
+    "python-multipart==0.0.20",
     "uvicorn",
     "json-repair",
 ]
