@@ -66,43 +66,90 @@ _DEFAULT_HEADERS = {
 _TOKEN_RE = re.compile(r"[^a-z]+")
 
 
-def _name_tokens(name: str) -> List[str]:
-    """Break a player name into comparable lowercase, accent-free tokens.
+def _split_name(name: str) -> tuple:
+    """Return ``(tokens of length >= 2, single-letter initials)``.
 
-    Drops single-letter initials (e.g. the "C" in "Alcaraz C.") so that a
-    Kalshi name like "Carlos Alcaraz" and a SofaScore name like "Alcaraz C."
-    both reduce to the shared surname token {"alcaraz"}. Accents are stripped
-    so "Nedić" and "Nedic" compare equal.
+    Accents are stripped so "Nedić" and "Nedic" compare equal. Initials are
+    kept separately: "Alcaraz C." must still be able to agree with "Carlos
+    Alcaraz", and two "Wang"s must be told apart by "Y." vs "X.".
     """
     if not name:
-        return []
+        return [], []
     decomposed = unicodedata.normalize("NFKD", name)
     ascii_name = "".join(c for c in decomposed if not unicodedata.combining(c))
     cleaned = _TOKEN_RE.sub(" ", ascii_name.lower())
-    return [t for t in cleaned.split() if len(t) >= 2]
+    tokens: List[str] = []
+    initials: List[str] = []
+    for piece in cleaned.split():
+        if len(piece) >= 2:
+            tokens.append(piece)
+        elif len(piece) == 1:
+            initials.append(piece)
+    return tokens, initials
 
 
-def names_match(name_a: str, name_b: str) -> bool:
+def _name_tokens(name: str) -> List[str]:
+    """Significant (length >= 2) tokens of a player name. Initials are dropped."""
+    tokens, _initials = _split_name(name)
+    return tokens
+
+
+def _given_names_agree(
+    given_a: List[str],
+    given_b: List[str],
+    initials_a: List[str],
+    initials_b: List[str],
+) -> bool:
+    """True when both sides have a given-name signal and those signals agree."""
+    if not (given_a or initials_a) or not (given_b or initials_b):
+        return False
+    if set(given_a) & set(given_b):
+        return True
+    for token in given_a:
+        if token[0] in initials_b:
+            return True
+    for token in given_b:
+        if token[0] in initials_a:
+            return True
+    return bool(set(initials_a) & set(initials_b))
+
+
+def names_match(name_a: str, name_b: str, *, allow_surname_only: bool = True) -> bool:
     """True if two player names plausibly refer to the same person.
 
-    SURNAME-based (the last significant token), NOT any-token overlap — so it
-    no longer matches on shared FIRST names ("Elena" Rybakina vs "Elena"
-    Milovanovic) or on a surname colliding with another's first name. This is
-    deliberately permissive about same-surname players (e.g. two "Wang"s); the
-    caller disambiguates by requiring BOTH players of a match to line up
-    (see TennisSet3Strategy._live_match_for_market).
+    Matching is surname-based (the last significant token), not any-token
+    overlap, so "Elena Rybakina" does not match "Elena Milovanovic".
+
+    When the surnames are equal and both names carry a given name or initial,
+    those must agree ("Yafan Wang" matches "Wang Y." and not "Wang X.").
+    ``allow_surname_only`` controls a bare surname ("Wang", "Assche") with no
+    given-name signal. Callers pass False when the two players in a match
+    share a surname, because a surname-only hit cannot tell them apart.
     """
-    a = _name_tokens(name_a)
-    b = _name_tokens(name_b)
-    if not a or not b:
+    tokens_a, initials_a = _split_name(name_a)
+    tokens_b, initials_b = _split_name(name_b)
+    if not tokens_a or not tokens_b:
         return False
-    surname_a, surname_b = a[-1], b[-1]
+    surname_a, surname_b = tokens_a[-1], tokens_b[-1]
+    given_a, given_b = tokens_a[:-1], tokens_b[:-1]
     if surname_a == surname_b:
-        return True
-    # Handle multi-part surnames represented differently across sources
-    # (e.g. "Van Assche" vs "Assche"): a surname appearing among the other's
-    # tokens still counts, but a bare first-name token never will.
-    return surname_a in b or surname_b in a
+        if _given_names_agree(given_a, given_b, initials_a, initials_b):
+            return True
+        # Both sides named a given name and they disagree.
+        if (given_a or initials_a) and (given_b or initials_b):
+            return False
+        return allow_surname_only
+    # Multi-part surnames written differently ("Van Assche" vs "Assche"):
+    # the surname token appears among the other name's tokens. A shared
+    # first name never reaches here, because the surnames differ.
+    return surname_a in tokens_b or surname_b in tokens_a
+
+
+def players_share_surname(name_a: str, name_b: str) -> bool:
+    """True when both names reduce to the same surname token."""
+    tokens_a, _ = _split_name(name_a)
+    tokens_b, _ = _split_name(name_b)
+    return bool(tokens_a and tokens_b and tokens_a[-1] == tokens_b[-1])
 
 
 @dataclass
@@ -160,9 +207,25 @@ class LiveTennisMatch:
     # -- per-set helpers (for the "2-0 sweep in progress" rule) --------------
 
     def _side_of(self, name: str) -> Optional[str]:
-        if names_match(name, self.home_name):
+        """Which side ``name`` is, or None when it is ambiguous.
+
+        Checking home first is wrong when both players share a surname:
+        "Yafan Wang" matches "Wang X." and "Wang Y." equally, so the home
+        player would always win. In that match, given names or initials have
+        to pick a unique side. If they can't, return None and the caller skips
+        the match instead of trading the wrong player.
+        """
+        collision = players_share_surname(self.home_name, self.away_name)
+        allow_surname_only = not collision
+        home_hit = names_match(
+            name, self.home_name, allow_surname_only=allow_surname_only
+        )
+        away_hit = names_match(
+            name, self.away_name, allow_surname_only=allow_surname_only
+        )
+        if home_hit and not away_hit:
             return "home"
-        if names_match(name, self.away_name):
+        if away_hit and not home_hit:
             return "away"
         return None
 
@@ -322,13 +385,19 @@ class SofaScoreClient:
         self.timeout = timeout
         self._owns_session = session is None
         self.session = session or AsyncSession()
+        # Set when the live feed is blocked, rate-limited, or unreachable so
+        # the trading loop can back off instead of polling again immediately.
+        self.last_fetch_blocked = False
 
     async def get_live_tennis_matches(self) -> List[LiveTennisMatch]:
         """Fetch all in-progress live tennis matches.
 
         Returns an empty list on any network/parse error so a caller can
-        degrade gracefully rather than crash the trading loop.
+        degrade gracefully rather than crash the trading loop. A block or
+        transport failure sets ``last_fetch_blocked`` so the caller backs off.
+        An HTTP 200 with no events is a quiet slate, not a block.
         """
+        self.last_fetch_blocked = False
         try:
             resp = await self.session.get(
                 SOFASCORE_LIVE_TENNIS_URL,
@@ -336,9 +405,17 @@ class SofaScoreClient:
                 impersonate=_IMPERSONATE,
                 timeout=self.timeout,
             )
+            status = getattr(resp, "status_code", None)
+            if status in (403, 429, 503):
+                self.last_fetch_blocked = True
+                logger.warning(
+                    "SofaScore live fetch blocked or rate-limited: HTTP %s", status
+                )
+                return []
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:  # noqa: BLE001 - never let SofaScore kill the loop
+            self.last_fetch_blocked = True
             logger.warning("SofaScore live fetch failed: %s", exc)
             return []
 

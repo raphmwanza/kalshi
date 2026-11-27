@@ -25,17 +25,30 @@ def setup_logging(log_level: str = "INFO") -> None:
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
     """
     from datetime import datetime
-    
-    # Create logs directory if it doesn't exist
-    logs_dir = Path("logs")
-    logs_dir.mkdir(exist_ok=True)
-    
-    # Create timestamped log file name
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = logs_dir / f"trading_system_{timestamp}.log"
-    
-    # Create a "latest.log" symlink/copy for easy access
-    latest_log = logs_dir / "latest.log"
+
+    file_flag = os.getenv("ENABLE_FILE_LOGGING", "true").strip().lower()
+    file_enabled = file_flag in {"1", "true", "yes", "on"}
+    handlers: list = [logging.StreamHandler(sys.stdout)]
+    log_file = None
+    latest_log = None
+
+    if file_enabled:
+        try:
+            logs_dir = Path("logs")
+            logs_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file = logs_dir / f"trading_system_{timestamp}.log"
+            latest_log = logs_dir / "latest.log"
+            handlers.insert(0, logging.FileHandler(log_file))
+            handlers.insert(1, logging.FileHandler(latest_log, mode="w"))
+        except OSError as exc:
+            print(
+                f"File logging unavailable ({exc}); logging to stdout only.",
+                file=sys.stderr,
+            )
+            file_enabled = False
+            log_file = None
+            latest_log = None
 
     # Silence noisy loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -59,26 +72,24 @@ def setup_logging(log_level: str = "INFO") -> None:
         cache_logger_on_first_use=True,
     )
     
-    # Configure standard library logging
+    # Configure standard library logging. stdout is always attached so a
+    # Railway worker (no log volume) still shows up in the platform logs.
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=getattr(logging, log_level.upper()),
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.FileHandler(latest_log, mode='w'),
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=handlers,
+        force=True,
     )
     
     # Log startup message
     logger = get_trading_logger("logging")
     logger.info(
         "Logging system initialized",
-        log_file=str(log_file),
-        latest_log=str(latest_log),
+        log_file=str(log_file) if log_file else None,
+        latest_log=str(latest_log) if latest_log else None,
         log_level=log_level,
         console_enabled=True,
-        file_enabled=True
+        file_enabled=file_enabled,
     )
 
 

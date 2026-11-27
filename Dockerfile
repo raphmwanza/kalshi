@@ -2,6 +2,8 @@ FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
+# Worker process: the tennis loop does not listen on a port. Logs go to stdout
+# (PYTHONUNBUFFERED). Configuration comes from environment variables only.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUTF8=1 \
@@ -19,7 +21,5 @@ COPY docker-entrypoint.sh ./
 RUN chmod +x docker-entrypoint.sh \
     && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir .
-
-EXPOSE 8501
 
 ENTRYPOINT ["./docker-entrypoint.sh"]

@@ -29,8 +29,10 @@ EXITS
     lives on the exchange it fills even if this bot is stopped.
   * Stop loss (35c): Kalshi has no native stop/trigger order, so this is
     polled each cycle and only fires WHILE THE BOT IS RUNNING. It sells 100%
-    of any position with >= $100 staked once its bid falls to/below 35c
-    (small positions are left to ride).
+    of every tennis position this strategy owns once its bid falls to or
+    below 35c. A missing or zero bid (no buyers) does not fire the stop.
+    The sell is immediate-or-cancel and reduce-only, so a failed cycle
+    cannot leave a resting stop that later flips the account short.
 
 HOW IT WORKS
 ------------
@@ -58,7 +60,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from src.clients.sofascore_client import LiveTennisMatch, SofaScoreClient, names_match
+from src.clients.sofascore_client import (
+    LiveTennisMatch,
+    SofaScoreClient,
+    names_match,
+    players_share_surname,
+)
+from src.utils.kalshi_fees import buy_debit_dollars, taker_fee_dollars
 from src.utils.market_prices import get_market_prices, is_tradeable_market
 
 logger = logging.getLogger(__name__)
@@ -96,14 +104,17 @@ MIN_SET_TO_ENTER = 3         # only trade once the match reaches set 3
 MIN_GAME_LEAD = 2            # backed player must be up by >= 2 games in the live set
 BANKROLL_CAP_USD = 5_000.0   # treat any total money above this as exactly this
 SELL_ALL_AT = 0.99           # always sell every held position once it hits 99c
-STOP_LOSS_AT = 0.35          # cut losses: sell if price falls to/below 35c ...
-STOP_LOSS_MIN_STAKE_USD = 100.0  # ... but only for positions with >= $100 staked
+STOP_LOSS_AT = 0.35          # cut losses: sell if the live bid falls to/below 35c
+# 0 = every tennis position, including small accounts. A positive value would
+# again leave stakes under that dollar amount without a stop.
+STOP_LOSS_MIN_STAKE_USD = 0.0
 ALL_IN_BELOW_CASH_USD = 10.0  # below this cash, skip the fraction and stake it all
-# Sub-$1 survival: a 75c contract is unaffordable, so buy the live leader
-# (up-by-2) at 25-50c instead of the 75-90 band.
-LOW_CASH_USD = 1.0
-LOW_CASH_MIN_ENTRY = 0.25
-LOW_CASH_MAX_ENTRY = 0.50
+# The old "cash < $1, buy the live leader at 25-50c" band was removed. A
+# player who is up by two games is the leader; a 25-50c price means the market
+# does not agree, so buying them there contradicted the 75-90c rule. Cheap
+# entries stay available only through the set-3 underdog overlay, which
+# requires a ranked favorite to actually be losing. Sub-$1 cash still buys
+# inside the normal band when the price plus the taker fee fits in cash.
 # Cash-reserve (PRIORITY over tiered sizing / all-in): never spend so much that
 # we'd lose the whole bankroll on a bad streak.
 #   cash >= $50 -> keep 70% as cash, spend at most 30%
@@ -190,12 +201,18 @@ def target_stake_usd(total_money: float) -> float:
 def contracts_for_stake(stake_usd: float, price_dollars: float, available_cash: float) -> int:
     """How many contracts to buy given a target stake and per-contract price.
 
-    The spend is capped by available cash so we never overdraw.
+    The spend, including Kalshi's taker fee, is capped by available cash so an
+    "all cash" order is not rejected for insufficient balance.
     """
     if price_dollars <= 0:
         return 0
-    spend = min(stake_usd, max(available_cash, 0.0))
-    return int(spend // price_dollars)
+    budget = min(max(stake_usd, 0.0), max(available_cash, 0.0))
+    if budget <= 0:
+        return 0
+    count = int(budget // price_dollars)
+    while count > 0 and buy_debit_dollars(count, price_dollars) > budget + 1e-9:
+        count -= 1
+    return count
 
 
 def cash_keep_fraction(
@@ -229,6 +246,31 @@ def max_spendable_cash(
 # ---------------------------------------------------------------------------
 # Strategy
 # ---------------------------------------------------------------------------
+
+def _pairing_matches(player: str, opponent: str, match: LiveTennisMatch) -> bool:
+    """True when Kalshi's two names are exactly this live match's two players.
+
+    If either pair shares a surname, a surname-only hit is not enough: the
+    given name or initial has to pick one orientation, and that orientation
+    has to be unique. Otherwise the match is skipped.
+    """
+    collision = players_share_surname(match.home_name, match.away_name) or (
+        players_share_surname(player, opponent)
+    )
+    allow = not collision
+
+    def hit(left: str, right: str) -> bool:
+        return names_match(left, right, allow_surname_only=allow)
+
+    home_player = hit(player, match.home_name) and hit(opponent, match.away_name)
+    away_player = hit(player, match.away_name) and hit(opponent, match.home_name)
+    if collision:
+        if home_player and (hit(player, match.away_name) or hit(opponent, match.home_name)):
+            return False
+        if away_player and (hit(player, match.home_name) or hit(opponent, match.away_name)):
+            return False
+    return home_player ^ away_player
+
 
 def _is_match_winner_ticker(ticker: str) -> bool:
     t = (ticker or "").upper()
@@ -347,22 +389,101 @@ def _position_qty(p: Dict) -> int:
         return 0
 
 
-def _order_yes_cents(order: Dict) -> Optional[int]:
-    """YES-side price of a Kalshi order in cents, or None if unknown."""
-    raw = order.get("yes_price_dollars")
-    if raw is not None:
+def _price_cents(order: Dict, dollar_key: str, cent_key: str) -> Optional[int]:
+    """Read a YES or NO price off an order, in cents."""
+    raw = order.get(dollar_key)
+    if raw is not None and raw != "":
         try:
             return int(round(float(raw) * 100))
         except (TypeError, ValueError):
             pass
-    raw = order.get("yes_price")
-    if raw is not None:
-        try:
-            v = float(raw)
-        except (TypeError, ValueError):
-            return None
-        return int(round(v * 100)) if v <= 1.0 else int(round(v))
-    return None
+    raw = order.get(cent_key)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return int(round(value * 100)) if value <= 1.0 else int(round(value))
+
+
+def _order_yes_cents(order: Dict) -> Optional[int]:
+    """YES-side price of a Kalshi order in cents, or None if unknown."""
+    return _price_cents(order, "yes_price_dollars", "yes_price")
+
+
+def _order_no_cents(order: Dict) -> Optional[int]:
+    """NO-side price in cents, or None if the order doesn't carry one."""
+    return _price_cents(order, "no_price_dollars", "no_price")
+
+
+def _order_exits_position(order: Dict, position_side: str) -> bool:
+    """True when ``order`` reduces a long YES or long NO position.
+
+    Selling YES is an ask on the YES book. Selling NO is a bid on the YES
+    book (buy YES at ``1 - price``). Legacy ``action`` + ``side`` are used
+    when present. ``outcome_side`` is not the contract side (sell-yes is
+    reported as outcome ``no``), so it is not used here.
+    """
+    action = str(order.get("action") or "").lower()
+    contract = str(order.get("side") or "").lower()
+    if action in ("buy", "sell") and contract in ("yes", "no"):
+        return action == "sell" and contract == position_side
+    book = str(order.get("book_side") or "").lower()
+    if position_side == "yes":
+        return book == "ask"
+    if position_side == "no":
+        return book == "bid"
+    return False
+
+
+def _exit_price_cents(order: Dict, position_side: str) -> Optional[int]:
+    """Limit price of an exit, in cents on the position's own side.
+
+    A 99c NO sell is quoted at 1c on the YES book. Comparing that YES price
+    to 99c never matches, so the bot used to cancel it and place another
+    every cycle.
+    """
+    if position_side == "yes":
+        return _order_yes_cents(order)
+    no_cents = _order_no_cents(order)
+    if no_cents is not None:
+        return no_cents
+    yes_cents = _order_yes_cents(order)
+    if yes_cents is None:
+        return None
+    return 100 - yes_cents
+
+
+def _remaining_order_qty(order: Dict) -> int:
+    raw = order.get("remaining_count_fp", order.get("remaining_count"))
+    try:
+        return round(float(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _has_bid(bid: Optional[float]) -> bool:
+    """False when the book has no buyers (missing quote or a zero bid)."""
+    return bid is not None and bid > 0
+
+
+def _covered_exit_qty(
+    orders: List[Dict], ticker: str, position_side: str, target_cents: int
+) -> int:
+    """Contracts already covered by a resting exit at the take-profit price."""
+    total = 0
+    for order in orders:
+        if order.get("ticker") != ticker:
+            continue
+        if not _order_exits_position(order, position_side):
+            continue
+        if _exit_price_cents(order, position_side) != target_cents:
+            continue
+        qty = _remaining_order_qty(order)
+        if qty > 0:
+            total += qty
+    return total
 
 
 def _position_stake_usd(p: Dict) -> float:
@@ -482,7 +603,8 @@ class TennisSet3Strategy:
         #    - take profit: ensure a resting SELL "cash-out line" at 99c sits on
         #      Kalshi for every position, so it fills even if this code is off.
         #    - stop loss: Kalshi has no native stop, so we poll — sell any
-        #      position with >= $100 staked that has fallen to/below 35c.
+        #      tennis position whose live bid has fallen to/below 35c. A missing
+        #      or zero bid does not fire the stop.
         await self._manage_open_positions(stats)
 
         # 1. Bankroll + target stake
@@ -516,7 +638,6 @@ class TennisSet3Strategy:
             stake = target_stake_usd(total_money)
         # Per-trade stake cannot exceed the cycle spend cap.
         stake = min(stake, spendable, cash)
-        low_cash = starting_cash < LOW_CASH_USD
 
         print(
             f"\n💰 Cash: ${cash:,.2f} | Positions: ${portfolio:,.2f} | "
@@ -529,13 +650,6 @@ class TennisSet3Strategy:
                 f"🛡️ Cash reserve PRIORITY: keep {keep_frac*100:.0f}% "
                 f"(${starting_cash * keep_frac:,.2f}) — max deploy this cycle "
                 f"${spendable:,.2f} of ${starting_cash:,.2f}",
-                flush=True,
-            )
-        if low_cash:
-            print(
-                f"🪙 Cash < ${LOW_CASH_USD:,.0f}: live-leader entry band "
-                f"{LOW_CASH_MIN_ENTRY*100:.0f}-{LOW_CASH_MAX_ENTRY*100:.0f}c "
-                f"(25-50c) — 75-90c contracts are unaffordable",
                 flush=True,
             )
         if all_in:
@@ -639,12 +753,23 @@ class TennisSet3Strategy:
                 flush=True,
             )
 
-        # 4. Existing exposure (skip tickers we already touch)
-        held = await self._existing_tickers()
+        # 4. Existing exposure (skip tickers we already touch). If either
+        # lookup fails, do not enter: an empty result would disable the
+        # duplicate check and the position cap.
+        exposure = await self._load_exposure()
+        if exposure is None:
+            stats["errors"] += 1
+            stats["entries_blocked"] = 1
+            stats["needs_backoff"] = True
+            print(
+                "🛑 Positions or orders lookup failed — skipping new entries this cycle",
+                flush=True,
+            )
+            return await self._finish(stats, start)
+        held, open_count = exposure
         traded_events: set = set()  # avoid two bets on the same match this cycle
         # Concurrency guard: how many positions are already open, plus how many
         # new bets we place this cycle, must stay under the cap.
-        open_count = await self._open_position_count()
         bets_this_cycle = 0
         if open_count >= self.max_concurrent_positions:
             print(
@@ -766,20 +891,11 @@ class TennisSet3Strategy:
                 else:
                     stats["skipped_no_match"] += 1
                     continue
-                if low_cash:
-                    lo, hi = LOW_CASH_MIN_ENTRY, LOW_CASH_MAX_ENTRY
-                else:
-                    lo, hi = self.min_win_probability, self.max_entry_price
+                lo, hi = self.min_win_probability, self.max_entry_price
                 if not (lo <= yes_ask <= hi):
                     continue
                 ask = yes_ask
                 stats["candidates"] += 1
-                if low_cash:
-                    print(
-                        f"  🪙 {ticker}: low-cash favorite {player} @ ${yes_ask:.2f} "
-                        f"(25-50c band, set {match.current_set})",
-                        flush=True,
-                    )
 
             if ticker in held:
                 stats["skipped_existing"] += 1
@@ -803,8 +919,10 @@ class TennisSet3Strategy:
                 break
 
             # Cash-reserve cap: stop opening new bets once we'd dip below the
-            # required cash floor (50% at $20+, 70% at $50+).
-            if keep_frac > 0 and spendable < ask:
+            # required cash floor (50% at $20+, 70% at $50+). The taker fee
+            # on one contract has to fit as well.
+            unit_cost = ask + taker_fee_dollars(1, ask)
+            if keep_frac > 0 and spendable + 1e-9 < unit_cost:
                 print(
                     f"  🛡️ Cash reserve reached — keeping "
                     f"${starting_cash * keep_frac:,.2f} unspent, stop entering this cycle",
@@ -816,7 +934,8 @@ class TennisSet3Strategy:
             if count < 1:
                 print(
                     f"  ⚠️  {ticker}: stake ${stake:,.2f} too small for ask "
-                    f"${ask:.2f} (spendable ${min(cash, spendable):,.2f}) — skip",
+                    f"${ask:.2f} plus taker fee "
+                    f"(spendable ${min(cash, spendable):,.2f}) — skip",
                     flush=True,
                 )
                 continue
@@ -827,10 +946,11 @@ class TennisSet3Strategy:
             if event:
                 traded_events.add(event)
             # Reduce remaining cash AND the cycle spend budget so multiple
-            # trades cannot breach the reserve.
-            cost = count * ask
-            cash = max(0.0, cash - cost)
-            spendable = max(0.0, spendable - cost)
+            # trades cannot breach the reserve. The taker fee is reserved too,
+            # otherwise the next "all cash" order is rejected.
+            debit = buy_debit_dollars(count, ask)
+            cash = max(0.0, cash - debit)
+            spendable = max(0.0, spendable - debit)
 
         return await self._finish(stats, start)
 
@@ -859,6 +979,10 @@ class TennisSet3Strategy:
         if rec is not None:
             print(f"  {format_daily_win_line(rec)}", flush=True)
         print(f"{'='*70}\n", flush=True)
+        if getattr(self.sofascore, "last_fetch_blocked", False) or getattr(
+            self.client, "hit_rate_limit", False
+        ):
+            stats["needs_backoff"] = True
         if self._owns_sofascore:
             await self.sofascore.close()
         return stats
@@ -940,13 +1064,7 @@ class TennisSet3Strategy:
         if not player or not opponent:
             return None
         for m in matches:
-            if (
-                names_match(player, m.home_name)
-                and names_match(opponent, m.away_name)
-            ) or (
-                names_match(player, m.away_name)
-                and names_match(opponent, m.home_name)
-            ):
+            if _pairing_matches(player, opponent, m):
                 return m
         return None
 
@@ -1063,17 +1181,19 @@ class TennisSet3Strategy:
     ) -> None:
         ticker = market["ticker"]
         price_cents = max(1, min(99, round(ask * 100)))
+        fee = taker_fee_dollars(count, ask)
         cost = count * ask
+        debit = cost + fee
 
         if self.dry_run:
             print(
                 f"  🏷️ [DRY] BUY {side.upper()} x{count} @ ${ask:.2f} "
-                f"(~${cost:,.2f}) | {player} in set {match.current_set} "
+                f"(~${debit:,.2f} incl. ${fee:.2f} fee) | {player} in set {match.current_set} "
                 f"[{match.score_label()}] | {ticker}",
                 flush=True,
             )
             stats["placed"] += 1
-            stats["total_deployed"] += cost
+            stats["total_deployed"] += debit
             return
 
         try:
@@ -1084,6 +1204,9 @@ class TennisSet3Strategy:
                 action="buy",
                 count=count,
                 type_="limit",
+                # Do not rest. A limit at the ask that misses must cancel
+                # immediately so the next cycle cannot stack a stale buy.
+                time_in_force="immediate_or_cancel",
             )
             # Marketable limit at the ask so it fills immediately but is price-bounded.
             if side == "yes":
@@ -1113,54 +1236,66 @@ class TennisSet3Strategy:
                     flush=True,
                 )
             stats["placed"] += 1
-            stats["total_deployed"] += cost
+            stats["total_deployed"] += debit
         except Exception as exc:  # noqa: BLE001
             print(f"  ❌ {ticker}: {exc}", flush=True)
             stats["errors"] += 1
 
     async def _manage_open_positions(self, stats: Dict) -> None:
-        """Exit management, run every cycle before placing new bets.
+        """Exit management for tennis match-winner positions this strategy owns.
 
-        For each open position (YES or NO):
-          * STOP LOSS (poll) — Kalshi has no native stop order, so we check the
-            live bid and sell 100% once it falls to/below ``stop_loss_at`` (35c),
-            but only for positions with at least ``stop_loss_min_stake`` ($100)
-            committed. This only fires while the bot is running.
-          * TAKE PROFIT (resting line) — ensure a resting SELL limit at
-            ``sell_all_at`` (99c) sits on Kalshi's book for the whole position.
-            Because it lives on the exchange, it fills even if this code is off.
-            Selling exactly the held quantity closes the position (Kalshi bars
-            reduce_only on resting orders, so it isn't used here).
+        Positions on any other series are left alone. For each owned position
+        (YES or NO):
+          * STOP LOSS (poll) — sell 100% when the live bid on that side is at
+            or below ``stop_loss_at`` (35c). A missing or zero bid is an empty
+            book, not a 1c print, so the stop does not fire. Unless
+            ``stop_loss_min_stake`` is set above 0, this applies to every
+            stake. The sell is immediate-or-cancel and reduce-only, and it is
+            sent only after resting orders on the ticker were cancelled.
+          * TAKE PROFIT — a resting sell at ``sell_all_at`` (99c) on the same
+            side as the position. The price is read on that side, so a 99c NO
+            sell (1c on the YES book) counts as already working.
         """
         try:
-            pos_resp = await self.client.get_positions()
+            rows = await self.client.list_market_positions()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Position management: positions fetch failed: %s", exc)
+            logger.error("Position management: positions fetch failed: %s", exc)
+            stats["needs_backoff"] = True
             return
 
+        nonzero = [p for p in rows if p.get("ticker") and _position_qty(p) != 0]
         positions = [
-            p for p in pos_resp.get("market_positions", [])
-            if _position_qty(p) != 0
+            p for p in nonzero if _is_match_winner_ticker(p.get("ticker") or "")
         ]
+        ignored = len(nonzero) - len(positions)
+        if ignored:
+            logger.info("Leaving %d non-tennis position(s) unmanaged", ignored)
         if not positions:
             return
 
-        # Kalshi V2 positions no longer include ``resting_orders_count``. Fetch
-        # resting SELL orders once and track how many contracts they already
-        # cover per ticker, so we top up the take-profit line to the FULL
-        # position (partial fills / leftover entry buys never leave a gap).
-        # Only sells at the CURRENT take-profit price count as cover — leftover
-        # 95c lines from the old rule are cancelled and replaced at 99c.
-        tp_cents = max(1, min(99, int(round(self.sell_all_at * 100))))
-        held_tickers = {p["ticker"] for p in positions}
-        await self._cancel_sells_not_at(held_tickers, tp_cents)
-        resting_sell = await self._resting_sell_qty(target_cents=tp_cents)
+        try:
+            resting = await self.client.list_orders(status="resting")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Position management: resting orders fetch failed; "
+                "not placing exits this cycle: %s",
+                exc,
+            )
+            stats["errors"] += 1
+            stats["needs_backoff"] = True
+            return
 
+        tp_cents = max(1, min(99, int(round(self.sell_all_at * 100))))
+        cancel_failed = await self._cancel_stale_exits(positions, resting, tp_cents)
+
+        if self.stop_loss_min_stake <= 0:
+            stop_label = "every tennis position"
+        else:
+            stop_label = f"stakes >= ${self.stop_loss_min_stake:,.0f}"
         print(
-            f"💵 Managing {len(positions)} open position(s) — "
+            f"💵 Managing {len(positions)} tennis position(s) — "
             f"resting take-profit line @ {self.sell_all_at * 100:.0f}c | "
-            f"stop-loss <= {self.stop_loss_at * 100:.0f}c on stakes "
-            f">= ${self.stop_loss_min_stake:,.0f}",
+            f"stop-loss <= {self.stop_loss_at * 100:.0f}c on {stop_label}",
             flush=True,
         )
 
@@ -1169,17 +1304,17 @@ class TennisSet3Strategy:
             contracts = _position_qty(p)       # signed: +YES, -NO
             side = "yes" if contracts > 0 else "no"
             qty = abs(contracts)
-            # Capital committed to this position (Kalshi reports cost basis as
-            # market_exposure_dollars; fall back to total_traded_dollars).
             stake_usd = _position_stake_usd(p)
-            covered = resting_sell.get(ticker, 0)
+            covered = _covered_exit_qty(resting, ticker, side, tp_cents)
 
             try:
                 mkt_resp = await self.client.get_market(ticker)
                 market = mkt_resp.get("market", mkt_resp)
                 yes_bid, _, no_bid, _ = get_market_prices(market)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("Position management: market fetch failed %s: %s", ticker, exc)
+                logger.warning(
+                    "Position management: market fetch failed %s: %s", ticker, exc
+                )
                 continue
 
             # Once Kalshi has closed/settled the market the match is over — a
@@ -1194,11 +1329,30 @@ class TennisSet3Strategy:
                 continue
 
             bid = yes_bid if side == "yes" else no_bid
+            stake_ok = (
+                self.stop_loss_min_stake <= 0
+                or stake_usd >= self.stop_loss_min_stake
+            )
 
-            # STOP LOSS first (must beat the resting take-profit line to the exit).
-            if stake_usd >= self.stop_loss_min_stake and bid <= self.stop_loss_at:
-                # Clear the resting cash-out line so nothing dangles after we exit.
-                await self._cancel_resting(ticker)
+            # STOP LOSS first. Never sell into an empty book (bid missing or 0):
+            # that used to become a 1c order via max(1, round(0)).
+            if stake_ok and not _has_bid(bid):
+                print(
+                    f"  ⏸️  {ticker}: no {side.upper()} bid — stop-loss not fired",
+                    flush=True,
+                )
+            elif stake_ok and bid <= self.stop_loss_at:
+                if not await self._cancel_resting(ticker):
+                    logger.error(
+                        "Stop-loss skipped for %s; resting orders could not be cancelled",
+                        ticker,
+                    )
+                    print(
+                        f"  ❌ {ticker}: stop-loss skipped — cancel of resting orders failed",
+                        flush=True,
+                    )
+                    stats["errors"] += 1
+                    continue
                 await self._submit_sell(
                     ticker, side, qty, bid,
                     reason=(
@@ -1209,9 +1363,14 @@ class TennisSet3Strategy:
                 )
                 continue
 
-            # TAKE PROFIT: make sure a resting SELL cash-out line covers the
-            # WHOLE position. Only resting SELL orders count as cover — a
-            # leftover resting entry BUY must never be mistaken for one.
+            if ticker in cancel_failed:
+                logger.error(
+                    "Take-profit top-up skipped for %s; a stale exit could not be cancelled",
+                    ticker,
+                )
+                stats["errors"] += 1
+                continue
+
             uncovered = qty - covered
             if uncovered > 0:
                 await self._place_take_profit_line(ticker, side, uncovered, stats)
@@ -1274,92 +1433,65 @@ class TennisSet3Strategy:
             print(f"  ❌ take-profit line {ticker}: {exc}", flush=True)
             stats["errors"] += 1
 
-    async def _resting_sell_qty(self, target_cents: Optional[int] = None) -> Dict[str, int]:
-        """Map ticker -> remaining contracts of RESTING SELL orders.
+    async def _cancel_stale_exits(
+        self, positions: List[Dict], orders: List[Dict], target_cents: int
+    ) -> set:
+        """Cancel resting exits that are not at the cash-out price.
 
-        Only SELL orders count as a take-profit "cash-out line". A leftover
-        resting BUY (an entry that didn't fully fill) must NOT be mistaken for
-        cover. If ``target_cents`` is set, only sells at that price count
-        (so a stale 95c line is not treated as the 99c cash-out).
+        Returns tickers whose cancel failed. The price is compared on the
+        position's side, so a 99c NO sell is kept.
         """
-        try:
-            resp = await self.client.get_orders(status="resting")
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("resting-orders fetch failed: %s", exc)
-            return {}
-        orders = resp.get("orders", []) if isinstance(resp, dict) else []
-        out: Dict[str, int] = {}
-        for o in orders:
-            if (o.get("action") or "").lower() != "sell":
+        side_of = {
+            p["ticker"]: "yes" if _position_qty(p) > 0 else "no" for p in positions
+        }
+        failed: set = set()
+        for order in orders:
+            ticker = order.get("ticker")
+            side = side_of.get(ticker)
+            if side is None or not _order_exits_position(order, side):
                 continue
-            ticker = o.get("ticker")
-            if not ticker:
+            price = _exit_price_cents(order, side)
+            if price == target_cents:
                 continue
-            if target_cents is not None and _order_yes_cents(o) != target_cents:
-                continue
-            raw = o.get("remaining_count_fp", o.get("remaining_count"))
-            try:
-                qty = round(float(raw))
-            except (TypeError, ValueError):
-                qty = 0
-            if qty > 0:
-                out[ticker] = out.get(ticker, 0) + qty
-        return out
-
-    async def _cancel_sells_not_at(self, tickers: set, target_cents: int) -> None:
-        """Cancel resting sells on ``tickers`` that are not at the cash-out price."""
-        try:
-            resp = await self.client.get_orders(status="resting")
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("stale-TP fetch failed: %s", exc)
-            return
-        for o in (resp.get("orders", []) if isinstance(resp, dict) else []):
-            if (o.get("action") or "").lower() != "sell":
-                continue
-            ticker = o.get("ticker")
-            if ticker not in tickers:
-                continue
-            if _order_yes_cents(o) == target_cents:
-                continue
-            oid = o.get("order_id")
+            oid = order.get("order_id")
             if not oid:
                 continue
             try:
-                await self.client.cancel_order(oid)
+                await self.client.cancel_order(oid, market_ticker=ticker)
                 print(
-                    f"  🔄 Cancelled stale cash-out @ {_order_yes_cents(o)}c "
+                    f"  🔄 Cancelled stale cash-out @ {price}c "
                     f"(replacing with {target_cents}c) | {ticker}",
                     flush=True,
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.debug("stale-TP cancel failed %s: %s", oid, exc)
+                failed.add(ticker)
+                logger.error("Stale cash-out cancel failed %s %s: %s", oid, ticker, exc)
+                print(
+                    f"  ❌ cancel failed {ticker} order {oid}: {exc}",
+                    flush=True,
+                )
+        return failed
 
-    async def _open_position_count(self) -> int:
-        """Number of markets we currently hold a nonzero position in."""
+    async def _cancel_resting(self, ticker: str) -> bool:
+        """Cancel resting orders on a ticker. False if any cancel did not land."""
         try:
-            resp = await self.client.get_positions()
+            orders = await self.client.list_orders(ticker=ticker, status="resting")
         except Exception as exc:  # noqa: BLE001
-            logger.debug("open-position count fetch failed: %s", exc)
-            return 0
-        return sum(
-            1 for p in resp.get("market_positions", []) if _position_qty(p) != 0
-        )
-
-    async def _cancel_resting(self, ticker: str) -> None:
-        """Cancel any resting orders on a ticker (e.g. the take-profit line)."""
-        try:
-            resp = await self.client.get_orders(ticker=ticker, status="resting")
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Cancel-resting: order fetch failed %s: %s", ticker, exc)
-            return
-        for o in (resp.get("orders", []) if isinstance(resp, dict) else []):
-            oid = o.get("order_id")
+            logger.error("Cancel-resting: order fetch failed %s: %s", ticker, exc)
+            print(f"  ❌ cancel-resting fetch failed {ticker}: {exc}", flush=True)
+            return False
+        ok = True
+        for order in orders:
+            oid = order.get("order_id")
             if not oid:
                 continue
             try:
-                await self.client.cancel_order(oid)
+                await self.client.cancel_order(oid, market_ticker=ticker)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("Cancel-resting: cancel failed %s: %s", oid, exc)
+                ok = False
+                logger.error("Cancel-resting: cancel failed %s %s: %s", oid, ticker, exc)
+                print(f"  ❌ cancel failed {ticker} order {oid}: {exc}", flush=True)
+        return ok
 
     async def _submit_sell(
         self,
@@ -1385,6 +1517,10 @@ class TennisSet3Strategy:
             return
 
         try:
+            if not _has_bid(bid):
+                logger.error("Refusing stop sell for %s; bid is missing or zero", ticker)
+                stats["errors"] += 1
+                return
             sell_kwargs = dict(
                 ticker=ticker,
                 client_order_id=str(uuid.uuid4()),
@@ -1392,6 +1528,10 @@ class TennisSet3Strategy:
                 action="sell",
                 count=qty,
                 type_="limit",
+                # IOC so a stop that misses does not rest. reduce_only so it
+                # cannot sell more than the position and flip the account short.
+                time_in_force="immediate_or_cancel",
+                reduce_only=True,
             )
             if side == "yes":
                 sell_kwargs["yes_price"] = price_cents
@@ -1493,20 +1633,33 @@ class TennisSet3Strategy:
                     break
         return markets
 
-    async def _existing_tickers(self) -> set:
-        """Tickers we already hold a position in or have a resting order on."""
-        tickers = set()
+    async def _load_exposure(self) -> Optional[Tuple[set, int]]:
+        """Return ``(held tickers, open position count)``.
+
+        ``None`` means the lookup failed and this cycle must not open new
+        trades. An empty set would disable the duplicate-entry check, and a
+        count of 0 would disable the position cap.
+        """
         try:
-            pos = await self.client.get_positions()
-            for p in pos.get("market_positions", []):
-                if _position_qty(p) != 0:
-                    tickers.add(p["ticker"])
+            positions = await self.client.list_market_positions()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Position fetch failed: %s", exc)
+            logger.error("Position lookup failed; skipping entries: %s", exc)
+            return None
         try:
-            orders = await self.client.get_orders(status="resting")
-            for o in orders.get("orders", []):
-                tickers.add(o["ticker"])
+            orders = await self.client.list_orders(status="resting")
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Orders fetch failed: %s", exc)
-        return tickers
+            logger.error("Orders lookup failed; skipping entries: %s", exc)
+            return None
+        held: set = set()
+        open_count = 0
+        for position in positions:
+            ticker = position.get("ticker")
+            if not ticker or _position_qty(position) == 0:
+                continue
+            held.add(ticker)
+            open_count += 1
+        for order in orders:
+            ticker = order.get("ticker")
+            if ticker:
+                held.add(ticker)
+        return held, open_count

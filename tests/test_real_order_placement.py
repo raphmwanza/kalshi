@@ -117,7 +117,7 @@ async def test_order_placement_flow():
         
         # 6. Cancel the order
         logger.info(f"🗑️ Cancelling order {order_id}...")
-        cancel_response = await kalshi_client.cancel_order(order_id)
+        cancel_response = await kalshi_client.cancel_order(order_id, market_ticker=ticker)
         logger.info(f"✅ Order cancelled: {cancel_response}")
         
         # 7. Verify order was cancelled

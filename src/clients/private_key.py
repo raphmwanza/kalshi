@@ -60,6 +60,28 @@ def find_private_key_file(configured: str) -> Optional[Path]:
     return None
 
 
+def normalize_pem_env(raw: str) -> str:
+    """Turn a PEM pasted into an env var into real PEM text.
+
+    Railway and other hosts often store a multi-line key as a single line
+    with escaped ``\\n``, sometimes wrapped in quotes, and sometimes with
+    real newlines or Windows ``\\r\\n``. All of those load.
+    """
+    pem = (raw or "").strip()
+    if len(pem) >= 2 and pem[0] == pem[-1] and pem[0] in {'"', "'"}:
+        pem = pem[1:-1].strip()
+    pem = (
+        pem.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+    pem = pem.strip()
+    if pem and not pem.endswith("\n"):
+        pem += "\n"
+    return pem
+
+
 def load_kalshi_private_key(configured: Optional[str] = None) -> Tuple[Any, str]:
     """Load the RSA key from ``KALSHI_PRIVATE_KEY`` or a PEM file.
 
@@ -67,9 +89,9 @@ def load_kalshi_private_key(configured: Optional[str] = None) -> Tuple[Any, str]
         (private_key, source) where source is ``KALSHI_PRIVATE_KEY`` or the
         file path that was read.
     """
-    pem = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
-    if pem:
-        pem = pem.replace("\\n", "\n")
+    pem = os.environ.get("KALSHI_PRIVATE_KEY", "")
+    if pem.strip():
+        pem = normalize_pem_env(pem)
         key = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
         return key, "KALSHI_PRIVATE_KEY"
 

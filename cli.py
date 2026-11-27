@@ -142,7 +142,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 def _run_safe_compounder(
     live_mode: bool = False,
     loop: bool = False,
-    interval: int = 300,
+    interval: float = 300,
 ) -> None:
     """Run the Safe Compounder strategy.
 
@@ -157,7 +157,13 @@ def _run_safe_compounder(
     if not live_mode:
         print("   DRY RUN — no real orders will be placed")
     if loop:
-        print(f"   Continuous mode — re-running every {interval}s. Ctrl-C to stop.")
+        from src.utils.loop_pace import MIN_LOOP_PAUSE_SECONDS, format_seconds
+
+        shown = format_seconds(max(float(interval), MIN_LOOP_PAUSE_SECONDS))
+        print(
+            f"   Continuous mode — at least {shown}s between cycles "
+            f"(requested {interval}s). Ctrl-C to stop."
+        )
 
     async def _run_once():
         client = KalshiClient()
@@ -172,16 +178,21 @@ def _run_safe_compounder(
 
     async def _run_forever():
         cycle = 0
+        failures = 0
         while True:
             cycle += 1
             print(f"\n──── Cycle {cycle} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ────")
             try:
-                await _run_once()
+                stats = await _run_once()
             except Exception as exc:
                 # One bad cycle shouldn't kill the loop. Log and keep going.
-                print(f"Cycle {cycle} failed: {exc}. Continuing after {interval}s.")
-            print(f"\n⏳ Sleeping {interval}s before next cycle...")
-            await asyncio.sleep(interval)
+                print(f"Cycle {cycle} failed: {exc}.")
+                stats = {"needs_backoff": True}
+            if isinstance(stats, dict) and stats.get("needs_backoff"):
+                failures += 1
+            else:
+                failures = 0
+            await _pause_for_next_cycle(interval, failures)
 
     try:
         if loop:
@@ -195,7 +206,7 @@ def _run_safe_compounder(
 def _run_tennis(
     live_mode: bool = False,
     loop: bool = False,
-    interval: int = 300,
+    interval: float = 300,
 ) -> None:
     """Run the Tennis Set-3 favorite strategy.
 
@@ -223,7 +234,13 @@ def _run_tennis(
     if not live_mode:
         print("   DRY RUN — no real orders will be placed")
     if loop:
-        print(f"   Continuous mode — re-running every {interval}s. Ctrl-C to stop.")
+        from src.utils.loop_pace import MIN_LOOP_PAUSE_SECONDS, format_seconds
+
+        shown = format_seconds(max(float(interval), MIN_LOOP_PAUSE_SECONDS))
+        print(
+            f"   Continuous mode — at least {shown}s between cycles "
+            f"(requested {interval}s). Ctrl-C to stop."
+        )
 
     async def _run_once():
         client = KalshiClient()
@@ -241,15 +258,20 @@ def _run_tennis(
 
     async def _run_forever():
         cycle = 0
+        failures = 0
         while True:
             cycle += 1
             print(f"\n──── Cycle {cycle} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ────")
             try:
-                await _run_once()
+                stats = await _run_once()
             except Exception as exc:
-                print(f"Cycle {cycle} failed: {exc}. Continuing after {interval}s.")
-            print(f"\n⏳ Sleeping {interval}s before next cycle...")
-            await asyncio.sleep(interval)
+                print(f"Cycle {cycle} failed: {exc}.")
+                stats = {"needs_backoff": True}
+            if isinstance(stats, dict) and stats.get("needs_backoff"):
+                failures += 1
+            else:
+                failures = 0
+            await _pause_for_next_cycle(interval, failures)
 
     try:
         if loop:
@@ -258,6 +280,35 @@ def _run_tennis(
             asyncio.run(_run_once())
     except KeyboardInterrupt:
         print("\nTennis strategy stopped by user.")
+
+
+def _parse_interval(value: str) -> float:
+    """Accept fractional seconds and 0. Negative values are rejected."""
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"interval must be a number of seconds, got {value!r}"
+        ) from exc
+    if seconds != seconds or seconds < 0:
+        raise argparse.ArgumentTypeError("interval must be >= 0")
+    return seconds
+
+
+async def _pause_for_next_cycle(interval: float, consecutive_failures: int) -> None:
+    """Wait before the next cycle, with a floor and exponential backoff."""
+    from src.utils.loop_pace import format_seconds, next_sleep_seconds
+
+    delay = next_sleep_seconds(interval, consecutive_failures)
+    label = format_seconds(delay)
+    if consecutive_failures:
+        print(
+            f"\n⏳ Backing off {label}s after errors or rate limits "
+            f"(streak {consecutive_failures})."
+        )
+    else:
+        print(f"\n⏳ Sleeping {label}s before next cycle...")
+    await asyncio.sleep(delay)
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:
@@ -813,9 +864,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument(
         "--interval",
-        type=int,
+        type=_parse_interval,
         default=300,
-        help="Seconds between cycles when --loop is set (default: 300)",
+        help=(
+            "Seconds between cycles when --loop is set (default: 300). "
+            "Fractions and 0 are allowed; a 1s minimum still applies, and "
+            "errors or rate limits back off exponentially."
+        ),
     )
     p_run.add_argument(
         "--log-level",
