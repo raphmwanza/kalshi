@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -43,7 +44,16 @@ from curl_cffi.requests import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-SOFASCORE_LIVE_TENNIS_URL = "https://api.sofascore.com/api/v1/sport/tennis/events/live"
+# Tried in order. api.sofascore.com is the documented host. www.sofascore.com/api
+# is what the site itself calls. api.sofascore.app is a sibling edge. A
+# datacenter IP is often Turnstile-challenged on all of them; the proxy below
+# is the way through when every host returns 403.
+SOFASCORE_LIVE_URLS = (
+    "https://api.sofascore.com/api/v1/sport/tennis/events/live",
+    "https://www.sofascore.com/api/v1/sport/tennis/events/live",
+    "https://api.sofascore.app/api/v1/sport/tennis/events/live",
+)
+SOFASCORE_LIVE_TENNIS_URL = SOFASCORE_LIVE_URLS[0]
 
 # Status descriptions that mean a match is NOT actively being played right now
 # even though SofaScore may still flag it "inprogress" (rain/medical stoppage,
@@ -53,21 +63,23 @@ _NOT_LIVE_HINTS = (
     "walkover", "delay", "abandon", "await", "pause",
 )
 
-# Browser profile curl_cffi impersonates (TLS + HTTP2 fingerprint).
-_IMPERSONATE = "chrome"
+# Let curl_cffi set the User-Agent that belongs to this TLS fingerprint.
+# A hardcoded older UA on top of a newer impersonation is itself a 403.
+_IMPERSONATE_TARGETS = ("chrome152", "chrome131", "chrome")
 
-# A browser fetch from the SofaScore site. The User-Agent matches the
-# impersonated Chrome; Cloudflare rejects a fingerprint that disagrees with it.
+# A browser fetch from the SofaScore site.
 _DEFAULT_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://www.sofascore.com",
     "Referer": "https://www.sofascore.com/",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    ),
 }
+
+# After a 403, skip SofaScore for a growing pause. ESPN still runs every cycle.
+_SOFASCORE_BACKOFF_START = 30.0
+_SOFASCORE_BACKOFF_MAX = 300.0
+_sofascore_retry_at = 0.0
+_sofascore_backoff = _SOFASCORE_BACKOFF_START
 
 ESPN_SCOREBOARDS = (
     "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard",
@@ -560,6 +572,27 @@ def _sets_won(event: Dict, score_key: str, opp_key: str) -> int:
     return won
 
 
+def reset_sofascore_backoff() -> None:
+    """Tests start from a clean cooldown."""
+    global _sofascore_retry_at, _sofascore_backoff
+    _sofascore_retry_at = 0.0
+    _sofascore_backoff = _SOFASCORE_BACKOFF_START
+
+
+def sofascore_in_backoff() -> bool:
+    return time.monotonic() < _sofascore_retry_at
+
+
+def _note_sofascore_blocked() -> None:
+    global _sofascore_retry_at, _sofascore_backoff
+    _sofascore_retry_at = time.monotonic() + _sofascore_backoff
+    _sofascore_backoff = min(_sofascore_backoff * 2, _SOFASCORE_BACKOFF_MAX)
+
+
+def _note_sofascore_ok() -> None:
+    reset_sofascore_backoff()
+
+
 def sofascore_proxy_url() -> str:
     """Optional HTTP proxy for SofaScore only. Never logged (it may hold a password)."""
     return os.environ.get("SOFASCORE_PROXY_URL", "").strip()
@@ -604,50 +637,97 @@ class SofaScoreClient:
         """
         self.last_fetch_blocked = False
         self.score_source = ""
-        matches, ok = await self._load_sofascore()
+        if sofascore_in_backoff():
+            logger.info("SofaScore cooling down after a block; trying ESPN this cycle")
+            matches, ok = [], False
+        else:
+            matches, ok = await self._load_sofascore()
         if ok:
             self.score_source = "sofascore"
-            logger.info("SofaScore: %d live tennis matches fetched", len(matches))
+            _note_sofascore_ok()
+            line = f"scores: SofaScore ({len(matches)} live)"
+            logger.info(line)
+            print(line, flush=True)
             return matches
         espn_matches, espn_ok = await self._load_espn()
         if espn_ok:
             self.score_source = "espn"
-            logger.warning(
-                "SofaScore live fetch failed; using ESPN scoreboard (%d in-progress matches)",
-                len(espn_matches),
-            )
+            line = f"scores: ESPN ({len(espn_matches)} live)"
+            logger.warning("SofaScore unavailable; %s", line)
+            print(line, flush=True)
             return espn_matches
         self.last_fetch_blocked = True
         logger.error(
-            "Live scores unavailable: SofaScore and ESPN both failed. "
-            "No new entries this cycle."
+            "scores: none (SofaScore and ESPN both failed). No new entries this cycle."
         )
+        print("scores: none (SofaScore and ESPN both failed)", flush=True)
         return []
 
     async def _load_sofascore(self) -> tuple:
         proxy = sofascore_proxy_url()
-        kwargs = {
-            "headers": _DEFAULT_HEADERS,
-            "impersonate": _IMPERSONATE,
-            "timeout": self.timeout,
-        }
         if proxy:
-            kwargs["proxy"] = proxy
             logger.info("SofaScore request is using SOFASCORE_PROXY_URL")
-        try:
-            resp = await self.session.get(SOFASCORE_LIVE_TENNIS_URL, **kwargs)
+        blocked_status = None
+        for url in SOFASCORE_LIVE_URLS:
+            try:
+                resp = await self._sofascore_get(url, proxy)
+            except Exception as exc:  # noqa: BLE001 - never let SofaScore kill the loop
+                logger.warning("SofaScore live fetch failed: %s", _public_error(exc))
+                continue
             status = getattr(resp, "status_code", None)
             if status in (403, 429, 503):
-                logger.warning(
-                    "SofaScore live fetch blocked or rate-limited: HTTP %s", status
-                )
-                return [], False
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:  # noqa: BLE001 - never let SofaScore kill the loop
-            logger.warning("SofaScore live fetch failed: %s", _public_error(exc))
-            return [], False
-        return _matches_from_sofascore(data), True
+                blocked_status = status
+                continue
+            if status != 200:
+                logger.warning("SofaScore live fetch HTTP %s", status)
+                continue
+            body = getattr(resp, "content", None)
+            if body == b"" or body == "":
+                logger.warning("SofaScore live fetch returned an empty body")
+                continue
+            try:
+                data = resp.json()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("SofaScore live fetch was not JSON: %s", _public_error(exc))
+                continue
+            return _matches_from_sofascore(data), True
+        if blocked_status is not None:
+            _note_sofascore_blocked()
+            logger.warning(
+                "SofaScore live fetch blocked or rate-limited: HTTP %s "
+                "(cooling down, ESPN will be used until the next retry)",
+                blocked_status,
+            )
+        else:
+            _note_sofascore_blocked()
+            logger.warning(
+                "SofaScore live fetch failed on every host "
+                "(cooling down, ESPN will be used until the next retry)"
+            )
+        return [], False
+
+    async def _sofascore_get(self, url: str, proxy: str):
+        """GET one SofaScore URL, falling back if this curl_cffi build lacks the fingerprint."""
+        last_exc = None
+        for impersonate in _IMPERSONATE_TARGETS:
+            kwargs = {
+                "headers": _DEFAULT_HEADERS,
+                "impersonate": impersonate,
+                "timeout": self.timeout,
+            }
+            if proxy:
+                kwargs["proxy"] = proxy
+            try:
+                return await self.session.get(url, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                text = str(exc).lower()
+                if "impersonat" in text or "unknown target" in text:
+                    last_exc = exc
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("SofaScore request was not sent")
 
     async def _load_espn(self) -> tuple:
         from src.clients.espn_tennis import matches_from_espn_scoreboard

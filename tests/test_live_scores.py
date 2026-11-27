@@ -7,7 +7,11 @@ import logging
 import pytest
 
 from src.clients.espn_tennis import matches_from_espn_scoreboard
-from src.clients.sofascore_client import SofaScoreClient, entry_matches
+from src.clients.sofascore_client import (
+    SofaScoreClient,
+    entry_matches,
+    reset_sofascore_backoff,
+)
 
 
 class _Response:
@@ -141,6 +145,7 @@ def test_espn_parser_keeps_only_in_progress_singles():
 
 @pytest.mark.asyncio
 async def test_sofascore_success_does_not_call_espn():
+    reset_sofascore_backoff()
     session = _Session([_Response(200, _sofascore_event())])
     client = SofaScoreClient(session=session)
     matches = await client.get_live_tennis_matches()
@@ -151,17 +156,21 @@ async def test_sofascore_success_does_not_call_espn():
     assert len(session.calls) == 1
     url, kwargs = session.calls[0]
     assert "sofascore" in url
-    assert kwargs["impersonate"] == "chrome"
+    assert kwargs["impersonate"] == "chrome152"
     assert kwargs["headers"]["Origin"] == "https://www.sofascore.com"
     assert kwargs["headers"]["Referer"] == "https://www.sofascore.com/"
-    assert "Chrome/" in kwargs["headers"]["User-Agent"]
+    assert "Accept-Language" in kwargs["headers"]
+    assert "User-Agent" not in kwargs["headers"]
     assert "proxy" not in kwargs
 
 
 @pytest.mark.asyncio
 async def test_sofascore_403_uses_espn_and_proxy(monkeypatch):
+    reset_sofascore_backoff()
     monkeypatch.setenv("SOFASCORE_PROXY_URL", "http://user:secret@proxy.example:8080")
     session = _Session([
+        _Response(403, {"error": "challenge"}),
+        _Response(403, {"error": "challenge"}),
         _Response(403, {"error": "challenge"}),
         _Response(200, _espn_live()),
         _Response(200, {"events": []}),
@@ -171,13 +180,45 @@ async def test_sofascore_403_uses_espn_and_proxy(monkeypatch):
     assert client.last_fetch_blocked is False
     assert client.score_source == "espn"
     assert [m.home_name for m in matches] == ["Carlos Alcaraz"]
-    sofascore_call = session.calls[0]
-    assert sofascore_call[1]["proxy"] == "http://user:secret@proxy.example:8080"
-    assert all("proxy" not in call[1] for call in session.calls[1:])
+    sofascore_calls = [(url, kwargs) for url, kwargs in session.calls if "sofascore" in url]
+    espn_calls = [(url, kwargs) for url, kwargs in session.calls if "sofascore" not in url]
+    assert len(sofascore_calls) == 3
+    assert all(kwargs["proxy"] == "http://user:secret@proxy.example:8080" for _, kwargs in sofascore_calls)
+    assert espn_calls
+    assert all("proxy" not in kwargs for _, kwargs in espn_calls)
+
+
+@pytest.mark.asyncio
+async def test_sofascore_403_backs_off_and_keeps_using_espn(caplog):
+    reset_sofascore_backoff()
+    caplog.set_level(logging.INFO)
+    session = _Session([
+        _Response(403, {"error": "challenge"}),
+        _Response(403, {"error": "challenge"}),
+        _Response(403, {"error": "challenge"}),
+        _Response(200, _espn_live()),
+        _Response(200, {"events": []}),
+        _Response(200, _espn_live()),
+        _Response(200, {"events": []}),
+    ])
+    client = SofaScoreClient(session=session)
+    first = await client.get_live_tennis_matches()
+    assert client.score_source == "espn"
+    assert len(first) == 1
+    sofascore_calls = [url for url, _ in session.calls if "sofascore" in url]
+    assert len(sofascore_calls) == 3
+    used = len(session.calls)
+    second = await client.get_live_tennis_matches()
+    assert [m.home_name for m in second] == ["Carlos Alcaraz"]
+    assert client.score_source == "espn"
+    assert all("sofascore" not in url for url, _ in session.calls[used:])
+    assert "scores: ESPN (1 live)" in caplog.text
+    reset_sofascore_backoff()
 
 
 @pytest.mark.asyncio
 async def test_both_score_sources_fail_blocks_entries(caplog):
+    reset_sofascore_backoff()
     caplog.set_level(logging.WARNING)
     session = _Session([
         _Response(403, {}),
