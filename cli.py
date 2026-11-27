@@ -217,9 +217,7 @@ def _run_tennis(
 
     When ``loop`` is True, re-run every ``interval`` seconds until Ctrl-C.
     """
-    from src.clients.kalshi_client import KalshiClient
     from src.clients.sofascore_client import SofaScoreClient
-    from src.strategies.tennis_set3 import TennisSet3Strategy
 
     # The strategy prints emoji; ensure stdout can encode them on Windows
     # consoles (cp1252) so a print never crashes the trading loop.
@@ -242,42 +240,58 @@ def _run_tennis(
             f"(requested {interval}s). Ctrl-C to stop."
         )
 
-    async def _run_once():
-        client = KalshiClient()
+    from src.clients.accounts import load_kalshi_accounts
+    from src.journal.tennis_log import open_journal
+    from src.strategies.tennis_runner import run_tennis_accounts
+
+    accounts = load_kalshi_accounts()
+    print(f"   Accounts: {', '.join(account.name for account in accounts)}")
+
+    async def _run_once(journal):
         sofascore = SofaScoreClient()
         try:
-            strategy = TennisSet3Strategy(
-                client=client,
+            return await run_tennis_accounts(
+                accounts,
                 sofascore=sofascore,
-                dry_run=not live_mode,
+                journal=journal,
+                live=live_mode,
             )
-            return await strategy.run()
         finally:
             await sofascore.close()
-            await client.close()
 
     async def _run_forever():
+        journal = await open_journal()
         cycle = 0
         failures = 0
-        while True:
-            cycle += 1
-            print(f"\n──── Cycle {cycle} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ────")
-            try:
-                stats = await _run_once()
-            except Exception as exc:
-                print(f"Cycle {cycle} failed: {exc}.")
-                stats = {"needs_backoff": True}
-            if isinstance(stats, dict) and stats.get("needs_backoff"):
-                failures += 1
-            else:
-                failures = 0
-            await _pause_for_next_cycle(interval, failures)
+        try:
+            while True:
+                cycle += 1
+                print(f"\n──── Cycle {cycle} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ────")
+                try:
+                    stats = await _run_once(journal)
+                except Exception as exc:
+                    print(f"Cycle {cycle} failed: {exc}.")
+                    stats = {"needs_backoff": True}
+                if isinstance(stats, dict) and stats.get("needs_backoff"):
+                    failures += 1
+                else:
+                    failures = 0
+                await _pause_for_next_cycle(interval, failures)
+        finally:
+            await journal.close()
+
+    async def _run_single():
+        journal = await open_journal()
+        try:
+            await _run_once(journal)
+        finally:
+            await journal.close()
 
     try:
         if loop:
             asyncio.run(_run_forever())
         else:
-            asyncio.run(_run_once())
+            asyncio.run(_run_single())
     except KeyboardInterrupt:
         print("\nTennis strategy stopped by user.")
 
@@ -309,6 +323,29 @@ async def _pause_for_next_cycle(interval: float, consecutive_failures: int) -> N
     else:
         print(f"\n⏳ Sleeping {label}s before next cycle...")
     await asyncio.sleep(delay)
+
+
+def cmd_tennis_report(args: argparse.Namespace) -> None:
+    """Summarize the tennis journal: win rate, entry price, PnL, implied edge."""
+    from src.journal.summary import format_summary, summarize_events
+    from src.journal.tennis_log import open_journal
+
+    async def _go():
+        journal = await open_journal()
+        try:
+            events = await journal.load_events(account=getattr(args, "account", None) or None)
+        finally:
+            await journal.close()
+        print(format_summary(summarize_events(events)))
+
+    asyncio.run(_go())
+
+
+def cmd_tennis_dashboard(args: argparse.Namespace) -> None:
+    """Serve the tennis journal dashboard on localhost."""
+    from src.journal.dashboard import serve_dashboard
+
+    serve_dashboard(host=args.host, port=args.port)
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:
@@ -934,6 +971,30 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run a series of diagnostic checks: .env presence, API key configuration, Kalshi API connectivity, database initialization, and Python version.",
     )
     p_health.set_defaults(func=cmd_health)
+
+    p_report = subparsers.add_parser(
+        "tennis-report",
+        help="Summarize tennis win rate, entry price, PnL by rule, and implied edge",
+        description=(
+            "Read the tennis journal (Postgres when DATABASE_URL is postgres, "
+            "otherwise SQLite or JSONL) and print win rate, average entry price, "
+            "PnL by rule, and whether settled entries beat their implied probability."
+        ),
+    )
+    p_report.add_argument("--account", default="", help="Limit the report to one account name")
+    p_report.set_defaults(func=cmd_tennis_report)
+
+    p_tdash = subparsers.add_parser(
+        "tennis-dashboard",
+        help="Open a localhost dashboard of the tennis journal",
+        description=(
+            "Serve a small HTML dashboard on 127.0.0.1. This is not the Railway "
+            "worker; the deployed process still does not listen on a port."
+        ),
+    )
+    p_tdash.add_argument("--host", default="127.0.0.1")
+    p_tdash.add_argument("--port", type=int, default=8765)
+    p_tdash.set_defaults(func=cmd_tennis_dashboard)
 
     # --- close-all ---
     p_close = subparsers.add_parser(

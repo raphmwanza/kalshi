@@ -82,13 +82,24 @@ def normalize_pem_env(raw: str) -> str:
     return pem
 
 
-def load_kalshi_private_key(configured: Optional[str] = None) -> Tuple[Any, str]:
-    """Load the RSA key from ``KALSHI_PRIVATE_KEY`` or a PEM file.
+def load_kalshi_private_key(
+    configured: Optional[str] = None,
+    pem: Optional[str] = None,
+) -> Tuple[Any, str]:
+    """Load the RSA key from an explicit PEM, ``KALSHI_PRIVATE_KEY``, or a file.
+
+    An explicit ``pem`` wins over the environment variable so one process can
+    open several Kalshi accounts without swapping ``KALSHI_PRIVATE_KEY``.
 
     Returns:
-        (private_key, source) where source is ``KALSHI_PRIVATE_KEY`` or the
-        file path that was read.
+        (private_key, source) where source is ``explicit``,
+        ``KALSHI_PRIVATE_KEY``, or the file path that was read.
     """
+    if pem and pem.strip():
+        normalized = normalize_pem_env(pem)
+        key = serialization.load_pem_private_key(normalized.encode("utf-8"), password=None)
+        return key, "explicit"
+
     pem = os.environ.get("KALSHI_PRIVATE_KEY", "")
     if pem.strip():
         pem = normalize_pem_env(pem)

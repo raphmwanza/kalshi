@@ -63,8 +63,10 @@ from typing import Dict, List, Optional, Tuple
 from src.clients.sofascore_client import (
     LiveTennisMatch,
     SofaScoreClient,
+    is_semifinal_or_later,
     names_match,
     players_share_surname,
+    round_label_is_late,
 )
 from src.utils.kalshi_fees import buy_debit_dollars, taker_fee_dollars
 from src.utils.market_prices import get_market_prices, is_tradeable_market
@@ -527,11 +529,15 @@ class TennisSet3Strategy:
         max_concurrent_positions: int = MAX_CONCURRENT_POSITIONS,
         cash_reserve_half_usd: float = CASH_RESERVE_HALF_USD,
         cash_reserve_tight_usd: float = CASH_RESERVE_TIGHT_USD,
+        account_name: str = "default",
+        journal=None,
     ):
         self.client = client
         self.sofascore = sofascore or SofaScoreClient()
         self._owns_sofascore = sofascore is None
         self.dry_run = dry_run
+        self.account_name = account_name or "default"
+        self.journal = journal
         self.min_win_probability = min_win_probability
         self.max_entry_price = max_entry_price
         self.min_set = min_set
@@ -550,13 +556,17 @@ class TennisSet3Strategy:
         self.cash_reserve_tight_usd = cash_reserve_tight_usd
         self._daily_record_cache: Optional[Tuple[float, Dict]] = None
 
-    async def run(self, dry_run: Optional[bool] = None) -> Dict:
+    async def run(
+        self,
+        dry_run: Optional[bool] = None,
+        live_matches: Optional[List[LiveTennisMatch]] = None,
+    ) -> Dict:
         if dry_run is not None:
             self.dry_run = dry_run
 
         start = time.time()
         logger.info("=" * 70)
-        logger.info("TENNIS SET-3 FAVORITE STRATEGY")
+        logger.info("TENNIS SET-3 FAVORITE STRATEGY [%s]", self.account_name)
         logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         logger.info(
             "Rule: back player in set %d+ (or 2-0 sweep) only if they lead "
@@ -592,6 +602,7 @@ class TennisSet3Strategy:
             "skipped_existing": 0,
             "skipped_no_match": 0,
             "skipped_not_started": 0,
+            "skipped_late_round": 0,
             "errors": 0,
             "total_deployed": 0.0,
             "tp_lines_set": 0,
@@ -640,7 +651,7 @@ class TennisSet3Strategy:
         stake = min(stake, spendable, cash)
 
         print(
-            f"\n💰 Cash: ${cash:,.2f} | Positions: ${portfolio:,.2f} | "
+            f"\n👤 {self.account_name}  💰 Cash: ${cash:,.2f} | Positions: ${portfolio:,.2f} | "
             f"Total: ${total_money:,.2f}",
             flush=True,
         )
@@ -669,8 +680,11 @@ class TennisSet3Strategy:
         # 2. Live tennis matches that are actionable right now: either in
         #    set 3+, OR a player won set 1 and is currently leading set 2
         #    (on track for a straight-sets win that never reaches set 3).
-        print("📡 Fetching live tennis matches from SofaScore...", flush=True)
-        live_matches = await self.sofascore.get_live_tennis_matches()
+        if live_matches is None:
+            print("📡 Fetching live tennis matches from SofaScore...", flush=True)
+            live_matches = await self.sofascore.get_live_tennis_matches()
+        else:
+            print("📡 Using the shared SofaScore snapshot for this cycle...", flush=True)
         stats["live_matches"] = len(live_matches)
         actionable_matches = [m for m in live_matches if self._match_actionable(m)]
         stats["actionable_matches"] = len(actionable_matches)
@@ -829,6 +843,18 @@ class TennisSet3Strategy:
                 continue
             side = "yes"
             in_set3 = match.current_set >= self.min_set
+            if self._is_late_round(match, market):
+                stats["skipped_late_round"] += 1
+                print(
+                    f"  ⏭️  {ticker}: {match.round_name or 'semifinal or later'} "
+                    f"— skip semifinal and above",
+                    flush=True,
+                )
+                await self._log_signal(
+                    ticker, "late_round", player, side, yes_ask, 0, match,
+                    "skip", "semifinal_or_later",
+                )
+                continue
 
             # --- Set-3 ranking "upset" overlay (takes PRIORITY) ---------------
             # If a credible ranked favorite is losing to a much lower/unranked
@@ -867,6 +893,7 @@ class TennisSet3Strategy:
                     )
                     continue
                 ask = yes_ask
+                rule = "underdog"
                 stats["underdog_candidates"] += 1
                 print(
                     f"  🐕 {ticker}: backing UNDERDOG {player} @ ${yes_ask:.2f} "
@@ -895,11 +922,13 @@ class TennisSet3Strategy:
                 if not (lo <= yes_ask <= hi):
                     continue
                 ask = yes_ask
+                rule = "set3_favorite" if in_set3 else "sweep_favorite"
                 stats["candidates"] += 1
 
             if ticker in held:
                 stats["skipped_existing"] += 1
                 print(f"  ⏭️  {ticker}: already holding/resting — skip", flush=True)
+                await self._log_signal(ticker, rule, player, side, ask, 0, match, "skip", "existing")
                 continue
 
             # Don't place two bets on the same underlying match this cycle.
@@ -907,6 +936,7 @@ class TennisSet3Strategy:
             if event and event in traded_events:
                 stats["skipped_existing"] += 1
                 print(f"  ⏭️  {ticker}: same match already bet this cycle — skip", flush=True)
+                await self._log_signal(ticker, rule, player, side, ask, 0, match, "skip", "same_match")
                 continue
 
             # Concurrency cap: stop opening new positions once we'd exceed it.
@@ -916,6 +946,7 @@ class TennisSet3Strategy:
                     f"({self.max_concurrent_positions}) reached — stop entering this cycle",
                     flush=True,
                 )
+                await self._log_signal(ticker, rule, player, side, ask, 0, match, "skip", "position_cap")
                 break
 
             # Cash-reserve cap: stop opening new bets once we'd dip below the
@@ -928,6 +959,7 @@ class TennisSet3Strategy:
                     f"${starting_cash * keep_frac:,.2f} unspent, stop entering this cycle",
                     flush=True,
                 )
+                await self._log_signal(ticker, rule, player, side, ask, 0, match, "skip", "cash_reserve")
                 break
 
             count = contracts_for_stake(stake, ask, min(cash, spendable))
@@ -938,9 +970,13 @@ class TennisSet3Strategy:
                     f"(spendable ${min(cash, spendable):,.2f}) — skip",
                     flush=True,
                 )
+                await self._log_signal(ticker, rule, player, side, ask, 0, match, "skip", "size")
                 continue
 
-            await self._place(market, side, player, ask, count, match, stats)
+            await self._log_signal(
+                ticker, rule, player, side, ask, count, match, "enter", rule,
+            )
+            await self._place(market, side, player, ask, count, match, stats, rule=rule)
             held.add(ticker)
             bets_this_cycle += 1
             if event:
@@ -968,6 +1004,7 @@ class TennisSet3Strategy:
         print(f"  Underdog candidates: {stats['underdog_candidates']}", flush=True)
         print(f"  Skipped (upset avoid):{stats['skipped_upset_avoid']}", flush=True)
         print(f"  Skipped (not started):{stats['skipped_not_started']}", flush=True)
+        print(f"  Skipped (SF/final):  {stats.get('skipped_late_round', 0)}", flush=True)
         print(f"  Orders placed:       {stats['placed']}", flush=True)
         print(f"  Instantly filled:    {stats['filled']}", flush=True)
         print(f"  Skipped (existing):  {stats['skipped_existing']}", flush=True)
@@ -983,6 +1020,7 @@ class TennisSet3Strategy:
             self.client, "hit_rate_limit", False
         ):
             stats["needs_backoff"] = True
+        await self._record_sell_fills()
         if self._owns_sofascore:
             await self.sofascore.close()
         return stats
@@ -1022,13 +1060,15 @@ class TennisSet3Strategy:
                 break
             saw_today = False
             for s in rows:
+                outcome = classify_tennis_settlement(s)
+                if outcome in ("win", "loss"):
+                    await self._log_settlement(s, outcome)
                 local_d = _settlement_local_date(s)
                 if local_d is None:
                     continue
                 if local_d != today:
                     continue
                 saw_today = True
-                outcome = classify_tennis_settlement(s)
                 if outcome == "win":
                     wins += 1
                 elif outcome == "loss":
@@ -1169,6 +1209,132 @@ class TennisSet3Strategy:
             return f"set {m.current_set} tied (need up by {self.min_game_lead})"
         return f"set {m.current_set} lead is only {lead} (need {self.min_game_lead})"
 
+    def _is_late_round(self, match: LiveTennisMatch, market: Dict) -> bool:
+        """Semifinals and finals are skipped. Quarterfinals are not."""
+        if is_semifinal_or_later(
+            getattr(match, "round_name", "") or "",
+            getattr(match, "cup_round_type", None),
+        ):
+            return True
+        for label in (
+            market.get("_event_title"),
+            market.get("title"),
+            market.get("subtitle"),
+        ):
+            if label and round_label_is_late(str(label)):
+                return True
+        return False
+
+    async def _journal(self, **fields) -> None:
+        """Best-effort journal write. A logging failure must not stop trading."""
+        if self.journal is None:
+            return
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "account": self.account_name,
+            **fields,
+        }
+        if not payload.get("dedupe_key"):
+            payload["dedupe_key"] = (
+                f"{payload.get('kind')}:{self.account_name}:{uuid.uuid4()}"
+            )
+        try:
+            await self.journal.record(payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Trade journal write failed: %s", exc)
+
+    async def _log_signal(
+        self,
+        ticker: str,
+        rule: str,
+        player: str,
+        side: str,
+        price: float,
+        size: int,
+        match: LiveTennisMatch,
+        decision: str,
+        reason: str,
+    ) -> None:
+        await self._journal(
+            kind="signal",
+            ticker=ticker,
+            rule=rule,
+            player=player,
+            side=side,
+            price=price,
+            size=size,
+            fees=taker_fee_dollars(size, price) if size else 0.0,
+            implied_prob=price,
+            decision=decision,
+            match_label=f"{match.home_name} vs {match.away_name}",
+            score=match.score_label(),
+            details=reason,
+        )
+
+    async def _log_settlement(self, settlement: Dict, outcome: str) -> None:
+        ticker = settlement.get("ticker") or ""
+        yes = _fp_count(settlement.get("yes_count_fp") or settlement.get("yes_count"))
+        no = _fp_count(settlement.get("no_count_fp") or settlement.get("no_count"))
+        side = "yes" if yes >= no else "no"
+        size = int(round(yes if side == "yes" else no))
+        settled = str(settlement.get("settled_time") or "")
+        await self._journal(
+            kind="settlement",
+            ticker=ticker,
+            side=side,
+            size=size,
+            won=1 if outcome == "win" else 0,
+            exit_kind="settlement",
+            price=1.0 if outcome == "win" else 0.0,
+            dedupe_key=f"settlement:{self.account_name}:{ticker}:{settled}",
+        )
+
+    async def _record_sell_fills(self) -> None:
+        """Turn recent sell fills into exit rows (take-profit or other sales)."""
+        get_fills = getattr(self.client, "get_fills", None)
+        if get_fills is None or self.journal is None:
+            return
+        try:
+            resp = await get_fills(limit=100)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Fill sync for the journal failed: %s", exc)
+            return
+        fills = []
+        if isinstance(resp, dict):
+            fills = resp.get("fills") or resp.get("trades") or []
+        for fill in fills:
+            if (fill.get("action") or "").lower() != "sell":
+                continue
+            ticker = fill.get("ticker") or ""
+            trade_id = str(fill.get("trade_id") or fill.get("fill_id") or "")
+            if not ticker or not trade_id:
+                continue
+            price = None
+            for key in ("yes_price_dollars", "no_price_dollars", "price"):
+                raw = fill.get(key)
+                if raw is None or raw == "":
+                    continue
+                try:
+                    price = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if price > 1:
+                    price = price / 100.0
+                break
+            count = _fp_count(fill.get("count_fp") or fill.get("count"))
+            kind = "take_profit" if price is not None and price >= self.sell_all_at - 0.011 else "sell"
+            if price is not None and price <= self.stop_loss_at + 0.011:
+                kind = "stop"
+            await self._journal(
+                kind="exit",
+                ticker=ticker,
+                side=(fill.get("side") or ""),
+                price=price,
+                size=int(round(count)) if count else None,
+                exit_kind=kind,
+                dedupe_key=f"fill:{self.account_name}:{trade_id}",
+            )
+
     async def _place(
         self,
         market: Dict,
@@ -1178,12 +1344,14 @@ class TennisSet3Strategy:
         count: int,
         match: LiveTennisMatch,
         stats: Dict,
+        rule: str = "",
     ) -> None:
         ticker = market["ticker"]
         price_cents = max(1, min(99, round(ask * 100)))
         fee = taker_fee_dollars(count, ask)
         cost = count * ask
         debit = cost + fee
+        client_order_id = str(uuid.uuid4())
 
         if self.dry_run:
             print(
@@ -1194,12 +1362,30 @@ class TennisSet3Strategy:
             )
             stats["placed"] += 1
             stats["total_deployed"] += debit
+            await self._journal(
+                kind="order",
+                ticker=ticker,
+                rule=rule,
+                player=player,
+                side=side,
+                price=ask,
+                size=count,
+                fees=fee,
+                implied_prob=ask,
+                client_order_id=client_order_id,
+                order_status="dry_run",
+                fill_count=0,
+                order_action="buy",
+                match_label=f"{match.home_name} vs {match.away_name}",
+                score=match.score_label(),
+                dedupe_key=f"order:{self.account_name}:{client_order_id}",
+            )
             return
 
         try:
             order_kwargs = dict(
                 ticker=ticker,
-                client_order_id=str(uuid.uuid4()),
+                client_order_id=client_order_id,
                 side=side,
                 action="buy",
                 count=count,
@@ -1237,9 +1423,44 @@ class TennisSet3Strategy:
                 )
             stats["placed"] += 1
             stats["total_deployed"] += debit
+            await self._journal(
+                kind="order",
+                ticker=ticker,
+                rule=rule,
+                player=player,
+                side=side,
+                price=ask,
+                size=count,
+                fees=fee,
+                implied_prob=ask,
+                client_order_id=client_order_id,
+                order_status=str(status),
+                fill_count=int(filled or 0),
+                order_action="buy",
+                match_label=f"{match.home_name} vs {match.away_name}",
+                score=match.score_label(),
+                dedupe_key=f"order:{self.account_name}:{client_order_id}",
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"  ❌ {ticker}: {exc}", flush=True)
             stats["errors"] += 1
+            await self._journal(
+                kind="order",
+                ticker=ticker,
+                rule=rule,
+                player=player,
+                side=side,
+                price=ask,
+                size=count,
+                fees=fee,
+                implied_prob=ask,
+                client_order_id=client_order_id,
+                order_status="error",
+                fill_count=0,
+                order_action="buy",
+                details=str(exc),
+                dedupe_key=f"order:{self.account_name}:{client_order_id}",
+            )
 
     async def _manage_open_positions(self, stats: Dict) -> None:
         """Exit management for tennis match-winner positions this strategy owns.
@@ -1385,6 +1606,7 @@ class TennisSet3Strategy:
         running. If the market is already at/above 99c it simply fills now.
         """
         price_cents = max(1, min(99, int(round(self.sell_all_at * 100))))
+        client_order_id = str(uuid.uuid4())
 
         if self.dry_run:
             print(
@@ -1403,7 +1625,7 @@ class TennisSet3Strategy:
             # hold closes the position, so reduce_only isn't needed anyway.
             kwargs = dict(
                 ticker=ticker,
-                client_order_id=str(uuid.uuid4()),
+                client_order_id=client_order_id,
                 side=side,
                 action="sell",
                 count=qty,
@@ -1422,6 +1644,20 @@ class TennisSet3Strategy:
                 flush=True,
             )
             stats["tp_lines_set"] += 1
+            await self._journal(
+                kind="order",
+                ticker=ticker,
+                side=side,
+                price=price_cents / 100.0,
+                size=qty,
+                client_order_id=client_order_id,
+                order_status="resting",
+                fill_count=0,
+                order_action="sell",
+                exit_kind="take_profit",
+                rule="take_profit",
+                dedupe_key=f"order:{self.account_name}:{client_order_id}",
+            )
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             if "market_closed" in msg.lower() or "market closed" in msg.lower():
@@ -1505,6 +1741,7 @@ class TennisSet3Strategy:
     ) -> None:
         """Place a marketable limit sell for a whole position and record it."""
         price_cents = max(1, min(99, round(bid * 100)))
+        client_order_id = str(uuid.uuid4())
 
         if self.dry_run:
             print(
@@ -1523,7 +1760,7 @@ class TennisSet3Strategy:
                 return
             sell_kwargs = dict(
                 ticker=ticker,
-                client_order_id=str(uuid.uuid4()),
+                client_order_id=client_order_id,
                 side=side,
                 action="sell",
                 count=qty,
@@ -1538,13 +1775,41 @@ class TennisSet3Strategy:
             else:
                 sell_kwargs["no_price"] = price_cents
 
-            await self.client.place_order(**sell_kwargs)
+            resp = await self.client.place_order(**sell_kwargs)
+            order = resp.get("order", {}) if isinstance(resp, dict) else {}
+            filled = int(order.get("fill_count") or 0)
             print(
                 f"  ✅ SOLD {side.upper()} x{qty} @ ${bid:.2f} ({reason}) | {ticker}",
                 flush=True,
             )
             stats[f"{stat_key}_positions"] += 1
             stats[f"{stat_key}_contracts"] += qty
+            await self._journal(
+                kind="order",
+                ticker=ticker,
+                side=side,
+                price=bid,
+                size=qty,
+                client_order_id=client_order_id,
+                order_status=str(order.get("status") or "submitted"),
+                fill_count=filled,
+                order_action="sell",
+                exit_kind="stop",
+                rule="stop",
+                details=reason,
+                dedupe_key=f"order:{self.account_name}:{client_order_id}",
+            )
+            if filled > 0:
+                await self._journal(
+                    kind="exit",
+                    ticker=ticker,
+                    side=side,
+                    price=bid,
+                    size=filled,
+                    exit_kind="stop",
+                    rule="stop",
+                    dedupe_key=f"exit:{self.account_name}:{client_order_id}",
+                )
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             if "market_closed" in msg.lower() or "market closed" in msg.lower():

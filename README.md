@@ -112,6 +112,32 @@ Set these on the service:
 
 `KALSHI_PRIVATE_KEY_PATH` is unnecessary when `KALSHI_PRIVATE_KEY` is set. Do not commit the PEM.
 
+### Several accounts
+
+One deployment can run the tennis strategy on more than one Kalshi account. Each account has its own client, bankroll, position cap, and journal tag. SofaScore is fetched once per cycle and shared. If one account errors, the others still run.
+
+Set `KALSHI_ACCOUNTS` to a JSON list:
+
+```json
+[{"name":"main","api_key_id":"KEY","private_key":"-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"}]
+```
+
+Or use numbered variables, starting at 1 with no gaps: `KALSHI_ACCOUNT_NAME_1`, `KALSHI_API_KEY_ID_1`, `KALSHI_PRIVATE_KEY_1`, then `_2`, and so on. `KALSHI_API_KEY_1` is an alias for the key id. If neither form is set, the single `KALSHI_API_KEY` / `KALSHI_PRIVATE_KEY` pair is account `default`.
+
+### Journal, report, dashboard
+
+Every entry decision, order, stop, take-profit, and settlement is appended to a journal, tagged with the account name. `DATABASE_URL` starting with `postgres://` or `postgresql://` (what Railway injects for its Postgres) selects Postgres. A `sqlite://` URL uses SQLite. `TRADE_LOG_BACKEND=jsonl` writes `TRADE_LOG_PATH` (default `tennis_journal.jsonl`) instead.
+
+```bash
+python cli.py tennis-report                  # win rate, avg entry, PnL by rule, implied edge
+python cli.py tennis-report --account main
+python cli.py tennis-dashboard               # http://127.0.0.1:8765  (local only)
+```
+
+The settled edge is the realized win rate on contracts held to settlement minus their average entry price. Positive means those entries won more often than the price implied. The dashboard is a localhost page; the Railway process is still a worker and does not listen on a port.
+
+Semifinals and finals are not entered (SofaScore `cupRoundType` 1 or 2, or a round label of semifinal/final). Quarterfinals still qualify. A tournament named "ATP Finals" is not treated as the final round.
+
 ---
 
 ## What's Included

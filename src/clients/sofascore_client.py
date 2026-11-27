@@ -152,6 +152,49 @@ def players_share_surname(name_a: str, name_b: str) -> bool:
     return bool(tokens_a and tokens_b and tokens_a[-1] == tokens_b[-1])
 
 
+# SofaScore cupRoundType is the number of ties in a full knockout round.
+# 1 = final, 2 = semifinals. 230 is a qualifying final. Quarterfinals are 4.
+_LATE_CUP_ROUND_TYPES = {1, 2, 230}
+_SEMI_ROUND = re.compile(r"\bsemi[\s-]*finals?\b", re.IGNORECASE)
+_QUARTER_ROUND = re.compile(r"\bquarter[\s-]*finals?\b", re.IGNORECASE)
+_EXACT_FINAL = re.compile(r"(the\s+)?(grand\s+)?finals?", re.IGNORECASE)
+_FINAL_WORD = re.compile(r"\bfinal\b", re.IGNORECASE)
+
+
+def round_label_is_late(label: str) -> bool:
+    """True when a round label is a semifinal or a final.
+
+    Quarterfinals stay eligible. A tournament named "ATP Finals" is not itself
+    a final round; only a label that is the final, or that says semifinal, is.
+    """
+    if not label:
+        return False
+    text = re.sub(r"[_]+", " ", str(label))
+    text = re.sub(r"\s+", " ", text).strip()
+    if _QUARTER_ROUND.search(text):
+        return False
+    if _SEMI_ROUND.search(text):
+        return True
+    if _EXACT_FINAL.fullmatch(text):
+        return True
+    lowered = text.lower()
+    if re.search(r"\b(atp|wta|nitto)\s+finals\b", lowered) and not _FINAL_WORD.search(
+        lowered.replace("finals", " ")
+    ):
+        return False
+    return _FINAL_WORD.search(text) is not None
+
+
+def is_semifinal_or_later(round_name: str = "", cup_round_type=None) -> bool:
+    """True for semifinals, finals, and qualifying finals."""
+    try:
+        if cup_round_type is not None and int(cup_round_type) in _LATE_CUP_ROUND_TYPES:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return round_label_is_late(round_name)
+
+
 @dataclass
 class LiveTennisMatch:
     """A single in-progress tennis match from SofaScore."""
@@ -161,6 +204,8 @@ class LiveTennisMatch:
     current_set: int
     status_type: str
     status_description: str
+    round_name: str = ""
+    cup_round_type: Optional[int] = None
     home_sets_won: int = 0
     away_sets_won: int = 0
     home_ranking: Optional[int] = None
@@ -428,12 +473,20 @@ class SofaScoreClient:
                 home = home_team.get("name", "") or ""
                 away = away_team.get("name", "") or ""
                 status = ev.get("status") or {}
+                round_info = ev.get("roundInfo") or {}
+                cup_type = round_info.get("cupRoundType")
+                try:
+                    cup_type = int(cup_type) if cup_type is not None else None
+                except (TypeError, ValueError):
+                    cup_type = None
                 match = LiveTennisMatch(
                     home_name=home,
                     away_name=away,
                     current_set=_current_set_number(ev),
                     status_type=status.get("type", ""),
                     status_description=status.get("description", ""),
+                    round_name=str(round_info.get("name") or round_info.get("slug") or ""),
+                    cup_round_type=cup_type,
                     home_sets_won=_sets_won(ev, "homeScore", "awayScore"),
                     away_sets_won=_sets_won(ev, "awayScore", "homeScore"),
                     home_ranking=_parse_ranking(home_team.get("ranking")),
