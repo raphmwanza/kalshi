@@ -559,6 +559,7 @@ class TennisSet3Strategy:
         self.cash_reserve_half_usd = cash_reserve_half_usd
         self.cash_reserve_tight_usd = cash_reserve_tight_usd
         self._daily_record_cache: Optional[Tuple[float, Dict]] = None
+        self.markets_incomplete = False
 
     async def run(
         self,
@@ -733,6 +734,15 @@ class TennisSet3Strategy:
         # 3. Kalshi tennis MATCH-WINNER markets (no prop/spread markets)
         print("\n📊 Fetching Kalshi tennis match-winner markets...", flush=True)
         markets = await self._fetch_tennis_markets()
+        if self.markets_incomplete:
+            stats["tennis_markets"] = len(markets)
+            stats["errors"] += 1
+            stats["needs_backoff"] = True
+            print(
+                "🛑 Tennis market list is incomplete — skipping new entries this cycle",
+                flush=True,
+            )
+            return await self._finish(stats, start)
         stats["tennis_markets"] = len(markets)
         print(f"  {len(markets)} active match-winner markets", flush=True)
 
@@ -818,9 +828,13 @@ class TennisSet3Strategy:
                 stats["skipped_no_match"] += 1
                 continue
 
-            # Re-fetch fresh so the entry price reflects the live in-match market,
-            # not the (possibly stale/partial) bulk events snapshot.
-            market = await self._fresh_market(ticker) or snapshot
+            # The bulk events snapshot can be minutes old. A failed live quote
+            # must not be filled in with that snapshot.
+            market = await self._fresh_market(ticker)
+            if not market:
+                stats["errors"] += 1
+                logger.warning("Skipping %s; live quote unavailable", ticker)
+                continue
             market.setdefault("_event_category", snapshot.get("_event_category", ""))
 
             # The Kalshi market must still be open/trading — never try to enter a
@@ -1877,6 +1891,7 @@ class TennisSet3Strategy:
         """
         markets: List[Dict] = []
         seen = set()
+        self.markets_incomplete = False
         for series in MATCH_WINNER_SERIES:
             cursor = None
             page = 0
@@ -1894,6 +1909,7 @@ class TennisSet3Strategy:
                         "GET", "/trade-api/v2/events", params=params
                     )
                 except Exception as exc:  # noqa: BLE001
+                    self.markets_incomplete = True
                     logger.warning("Events fetch failed for %s p%d: %s", series, page, exc)
                     break
 
@@ -1930,6 +1946,11 @@ class TennisSet3Strategy:
                     break
                 page += 1
                 if page > 20:
+                    self.markets_incomplete = True
+                    logger.error(
+                        "Tennis market pagination stopped for %s with a cursor still set",
+                        series,
+                    )
                     break
         return markets
 

@@ -462,3 +462,33 @@ async def test_sofascore_block_requests_backoff_and_ambiguous_names_do_not_trade
     assert found is match
     await strategy.run()
     assert client.placed == []
+
+
+@pytest.mark.asyncio
+async def test_missing_live_quote_does_not_use_the_bulk_snapshot():
+    client = FakeKalshi()
+    client.balance = {"balance": 82, "portfolio_value": 0}
+    client.events = [_alcaraz_event()]
+
+    async def no_quote(ticker):
+        raise RuntimeError("market timeout")
+
+    client.get_market = no_quote
+    stats = await _strategy(client, [_live_alcaraz()]).run()
+    assert [order for order in client.placed if order["action"] == "buy"] == []
+    assert stats["errors"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_incomplete_market_list_skips_new_entries():
+    client = FakeKalshi()
+    client.balance = {"balance": 82, "portfolio_value": 0}
+    client.events = [_alcaraz_event()]
+
+    async def events_down(method, endpoint, params=None, json_data=None, require_auth=True):
+        raise RuntimeError("events down")
+
+    client._make_authenticated_request = events_down
+    stats = await _strategy(client, [_live_alcaraz()]).run()
+    assert client.placed == []
+    assert stats["needs_backoff"] is True

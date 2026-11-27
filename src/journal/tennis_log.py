@@ -9,8 +9,11 @@ instead, which is enough when no database is available.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 from urllib.parse import urlparse
 
 import aiosqlite
@@ -78,6 +81,25 @@ def _sqlite_path_from_url(url: str) -> str:
 def _is_postgres(url: str) -> bool:
     scheme = urlparse(url).scheme.lower()
     return scheme in {"postgres", "postgresql"}
+
+
+def _connection_lost(exc: BaseException) -> bool:
+    """True when the database socket died and a fresh connection can succeed."""
+    text = str(exc).lower()
+    if type(exc).__name__ in {
+        "InterfaceError",
+        "ConnectionDoesNotExistError",
+        "ConnectionFailureError",
+        "CannotConnectNowError",
+        "ConnectionResetError",
+    }:
+        return True
+    return (
+        "connection is closed" in text
+        or "connection was closed" in text
+        or "connection reset" in text
+        or "server closed the connection" in text
+    )
 
 
 class SqliteJournal:
@@ -164,29 +186,53 @@ class PostgresJournal:
             "CREATE UNIQUE INDEX IF NOT EXISTS tennis_journal_dedupe ON tennis_journal (dedupe_key)"
         )
 
+    async def _retry(self, run):
+        """Run once, and once more after a dropped connection.
+
+        Railway's Postgres proxy closes idle sockets. The trading loop holds
+        one journal connection for the life of the process, so the next write
+        has to open a new one instead of failing until the next deploy.
+        """
+        try:
+            return await run()
+        except Exception as exc:
+            if not _connection_lost(exc):
+                raise
+            logger.warning("Journal database connection dropped; reconnecting")
+            await self.close()
+            return await run()
+
     async def record(self, event: dict) -> None:
-        await self.open()
         row = _normalize(event)
         placeholders = ", ".join(f"${i + 1}" for i in range(len(COLUMNS)))
         names = ", ".join(COLUMNS)
-        await self._conn.execute(
+        sql = (
             f"INSERT INTO tennis_journal ({names}) VALUES ({placeholders}) "
-            f"ON CONFLICT (dedupe_key) DO NOTHING",
-            *[row[name] for name in COLUMNS],
+            f"ON CONFLICT (dedupe_key) DO NOTHING"
         )
+        args = [row[name] for name in COLUMNS]
+
+        async def run():
+            await self.open()
+            await self._conn.execute(sql, *args)
+
+        await self._retry(run)
 
     async def load_events(self, account: Optional[str] = None) -> List[dict]:
-        await self.open()
-        if account:
-            rows = await self._conn.fetch(
-                "SELECT id, " + ", ".join(COLUMNS) + " FROM tennis_journal WHERE account = $1 ORDER BY id",
-                account,
-            )
-        else:
-            rows = await self._conn.fetch(
-                "SELECT id, " + ", ".join(COLUMNS) + " FROM tennis_journal ORDER BY id"
-            )
-        return [dict(row) for row in rows]
+        async def run():
+            await self.open()
+            if account:
+                rows = await self._conn.fetch(
+                    "SELECT id, " + ", ".join(COLUMNS) + " FROM tennis_journal WHERE account = $1 ORDER BY id",
+                    account,
+                )
+            else:
+                rows = await self._conn.fetch(
+                    "SELECT id, " + ", ".join(COLUMNS) + " FROM tennis_journal ORDER BY id"
+                )
+            return [dict(row) for row in rows]
+
+        return await self._retry(run)
 
     async def close(self) -> None:
         if self._conn is not None:
