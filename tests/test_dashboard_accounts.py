@@ -396,6 +396,88 @@ def test_accounts_page_refuses_key_storage_without_encryption_key(monkeypatch, d
     assert "<textarea" not in page.text
 
 
+def test_login_accepts_railway_forwarded_host(monkeypatch, dashboard_env, caplog):
+    """Browser Origin is the public Railway URL; Host is the private upstream."""
+    import logging
+
+    from fastapi.testclient import TestClient
+
+    from src.journal.web import create_app
+
+    async def load_events():
+        return []
+
+    public = "kalshi-dashboard-production.up.railway.app"
+    caplog.set_level(logging.WARNING)
+    client = TestClient(create_app(load_events))
+    login = client.get("/login")
+    token = _csrf(login.text)
+    headers = {
+        "origin": f"https://{public}",
+        "x-forwarded-host": f"{public}:443, edge.railway.internal",
+        "x-forwarded-proto": "https,http",
+    }
+    response = client.post(
+        "/login",
+        data={"password": "s3cret", "csrf_token": token},
+        headers=headers,
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    home = client.get("/")
+    assert home.status_code == 200
+    assert "samesite=strict" in home.headers.get("set-cookie", "").lower()
+    # CSRF is still required on the proxied path.
+    client.cookies.clear()
+    login = client.get("/login")
+    missing = client.post(
+        "/login",
+        data={"password": "s3cret"},
+        headers=headers,
+    )
+    assert missing.status_code == 403
+    # A forged origin is still rejected when it does not match the forwarded host.
+    token = _csrf(login.text)
+    forged = client.post(
+        "/login",
+        data={"password": "s3cret", "csrf_token": token},
+        headers={
+            "origin": "https://evil.example",
+            "x-forwarded-host": public,
+            "x-forwarded-proto": "https",
+        },
+    )
+    assert forged.status_code == 403
+    assert "Cross-site request rejected." in forged.text
+    warning = caplog.text
+    assert "origin=https://evil.example" in warning
+    assert "x-forwarded-host=" + public in warning
+    assert "s3cret" not in warning
+
+
+def test_login_accepts_dashboard_public_url(monkeypatch, dashboard_env):
+    from fastapi.testclient import TestClient
+
+    from src.journal.web import create_app
+
+    async def load_events():
+        return []
+
+    public = "https://kalshi-dashboard-production.up.railway.app/accounts"
+    monkeypatch.setenv("DASHBOARD_PUBLIC_URL", public)
+    client = TestClient(create_app(load_events))
+    login = client.get("/login")
+    token = _csrf(login.text)
+    response = client.post(
+        "/login",
+        data={"password": "s3cret", "csrf_token": token},
+        headers={"origin": "https://kalshi-dashboard-production.up.railway.app"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+
 def test_cross_site_login_is_rejected(monkeypatch, dashboard_env):
     from fastapi.testclient import TestClient
 

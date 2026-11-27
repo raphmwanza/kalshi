@@ -394,11 +394,15 @@ def main() -> None:
 
     host = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
+    # Railway terminates TLS at the edge. Trust X-Forwarded-* so the public
+    # host is visible. CSRF and the session cookie do not depend on this.
     uvicorn.run(
         app,
         host=host,
         port=port,
         log_level=os.environ.get("LOG_LEVEL", "info").lower(),
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
 
 
