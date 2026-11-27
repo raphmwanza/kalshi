@@ -11,13 +11,17 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import time
 from typing import Dict
+from urllib.parse import urlparse
 
 from fastapi import Request
 from fastapi.responses import Response
+
+logger = logging.getLogger(__name__)
 
 SESSION_COOKIE = "dashboard_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
@@ -128,15 +132,75 @@ def csrf_ok(session: Dict, form_token: str) -> bool:
     return secrets.compare_digest(expected, provided)
 
 
+def _first_header_value(value: str) -> str:
+    return (value or "").split(",")[0].strip()
+
+
+def _clip_header(value: str, limit: int = 200) -> str:
+    """One log line, with no newlines a proxy could use to forge extra fields."""
+    cleaned = (value or "").replace("\r", " ").replace("\n", " ")
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit] + "…"
+
+
+def _origin_for(proto: str, host: str) -> str:
+    """scheme://host, dropping the default port browsers omit from Origin."""
+    proto = (proto or "").strip().lower()
+    host = (host or "").strip()
+    if proto not in {"http", "https"} or not host or " " in host or "\\" in host:
+        return ""
+    if proto == "https" and host.endswith(":443"):
+        host = host[:-4]
+    elif proto == "http" and host.endswith(":80"):
+        host = host[:-3]
+    return f"{proto}://{host}"
+
+
+def dashboard_public_origin() -> str:
+    """Origin of DASHBOARD_PUBLIC_URL, or empty when it is unset or unusable."""
+    raw = os.environ.get("DASHBOARD_PUBLIC_URL", "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    return _origin_for(parsed.scheme, parsed.netloc)
+
+
 def origin_ok(request: Request) -> bool:
-    """Reject a cross-site POST when the browser sent Origin."""
-    origin = request.headers.get("origin")
+    """Reject a cross-site POST when the browser sent Origin.
+
+    Railway's edge proxy often leaves ``Host`` as the internal upstream, while
+    the browser's Origin is the public site. ``X-Forwarded-Host`` (first value)
+    paired with ``X-Forwarded-Proto``, and ``DASHBOARD_PUBLIC_URL`` when set,
+    are the public names that match that Origin. The CSRF token is still
+    required on the form.
+    """
+    origin = (request.headers.get("origin") or "").strip()
     if not origin:
         return True
     host = request.headers.get("host") or ""
-    if not host:
-        return False
-    return origin == f"https://{host}" or origin == f"http://{host}"
+    forwarded_host_raw = request.headers.get("x-forwarded-host") or ""
+    forwarded_host = _first_header_value(forwarded_host_raw)
+    forwarded_proto = _first_header_value(request.headers.get("x-forwarded-proto") or "")
+    allowed = {
+        candidate
+        for candidate in (
+            _origin_for("https", host),
+            _origin_for("http", host),
+            _origin_for(forwarded_proto, forwarded_host),
+            dashboard_public_origin(),
+        )
+        if candidate
+    }
+    if origin in allowed:
+        return True
+    logger.warning(
+        "Rejected dashboard form origin=%s host=%s x-forwarded-host=%s",
+        _clip_header(origin),
+        _clip_header(host),
+        _clip_header(forwarded_host_raw),
+    )
+    return False
 
 
 def client_ip(request: Request) -> str:
