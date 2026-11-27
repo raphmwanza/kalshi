@@ -625,30 +625,31 @@ class TennisSet3Strategy:
             self.dry_run = dry_run
 
         start = time.time()
-        logger.info("=" * 70)
-        logger.info("TENNIS SET-3 FAVORITE STRATEGY [%s]", self.account_name)
-        logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        logger.info(
-            "Rule: back player in set %d+ (or 2-0 sweep) only if they lead "
-            "the live set by >= %d games and implied win prob %.0f-%.0f%% | "
-            "cash out @ %.0fc | tiered sizing (cap $%.0f)",
-            self.min_set, self.min_game_lead,
-            self.min_win_probability * 100, self.max_entry_price * 100,
-            self.sell_all_at * 100, BANKROLL_CAP_USD,
-        )
-        logger.info(
-            "Cash reserve PRIORITY: keep 50%% of cash at $%.0f+, keep 70%% at $%.0f+",
-            self.cash_reserve_half_usd, self.cash_reserve_tight_usd,
-        )
-        if self.rank_upset_enabled:
+        if not getattr(self, "_rules_logged", False):
+            logger.info("=" * 70)
+            logger.info("TENNIS SET-3 FAVORITE STRATEGY [%s]", self.account_name)
             logger.info(
-                "Set-3 ranking overlay ON: back the surging underdog (<= %.0fc) "
-                "when a rank<=%d favorite is losing to an unranked/>=%d-lower "
-                "opponent; avoid if favorite rank>%d or behind by >=%d in the last set",
-                self.underdog_max_entry * 100, RANK_UPSET_MAX_FAV_RANK,
-                RANK_UPSET_MIN_GAP, RANK_UPSET_MAX_FAV_RANK, RANK_UPSET_BLOWOUT_GAMES,
+                "Rule: back player in set %d+ (or 2-0 sweep) only if they lead "
+                "the live set by >= %d games and implied win prob %.0f-%.0f%% | "
+                "cash out @ %.0fc | tiered sizing (cap $%.0f)",
+                self.min_set, self.min_game_lead,
+                self.min_win_probability * 100, self.max_entry_price * 100,
+                self.sell_all_at * 100, BANKROLL_CAP_USD,
             )
-        logger.info("=" * 70)
+            logger.info(
+                "Cash reserve PRIORITY: keep 50%% of cash at $%.0f+, keep 70%% at $%.0f+",
+                self.cash_reserve_half_usd, self.cash_reserve_tight_usd,
+            )
+            if self.rank_upset_enabled:
+                logger.info(
+                    "Set-3 ranking overlay ON: back the surging underdog (<= %.0fc) "
+                    "when a rank<=%d favorite is losing to an unranked/>=%d-lower "
+                    "opponent; avoid if favorite rank>%d or behind by >=%d in the last set",
+                    self.underdog_max_entry * 100, RANK_UPSET_MAX_FAV_RANK,
+                    RANK_UPSET_MIN_GAP, RANK_UPSET_MAX_FAV_RANK, RANK_UPSET_BLOWOUT_GAMES,
+                )
+            logger.info("=" * 70)
+            self._rules_logged = True
 
         stats = {
             "live_matches": 0,

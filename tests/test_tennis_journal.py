@@ -225,7 +225,9 @@ async def test_runner_isolates_account_errors_and_fetches_sofascore_once():
             return await super().get_live_tennis_matches()
 
     from src.clients.accounts import KalshiAccount
+    from src.strategies.tennis_runner import reset_account_sessions
 
+    reset_account_sessions()
     sofa = CountingSofa()
     good = FakeKalshi()
     good.events = [_alcaraz_event()]
