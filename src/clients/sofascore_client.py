@@ -671,7 +671,7 @@ class SofaScoreClient:
         return []
 
     async def _load_flashscore(self) -> tuple:
-        from src.clients.flashscore_tennis import FLASHSCORE_URLS, flashscore_headers, matches_from_flashscore_feed
+        from src.clients.flashscore_tennis import FLASHSCORE_URLS, flashscore_headers, parse_flashscore_board
 
         headers = flashscore_headers()
         for url in FLASHSCORE_URLS:
@@ -693,7 +693,10 @@ class SofaScoreClient:
             if not (text or "").strip():
                 logger.warning("Flashscore live fetch returned an empty body")
                 continue
-            return matches_from_flashscore_feed(text), True
+            matches = parse_flashscore_board(text)
+            if matches is not None:
+                return matches, True
+            logger.warning("Flashscore returned an unrecognized tennis feed")
         return [], False
 
     async def _load_sofascore(self) -> tuple:
