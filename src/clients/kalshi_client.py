@@ -16,11 +16,34 @@ from urllib.parse import urlencode
 
 import httpx
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import ed25519, padding
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
 from src.clients.private_key import load_kalshi_private_key
 from src.config.settings import settings
 from src.utils.logging_setup import TradingLoggerMixin
+
+
+def sign_kalshi_message(private_key, message: bytes) -> bytes:
+    """Raw signature bytes for one Kalshi pre-sign message.
+
+    Ed25519 signs the message itself. RSA uses RSA-PSS over SHA-256.
+    """
+    if isinstance(private_key, ed25519.Ed25519PrivateKey):
+        return private_key.sign(message)
+    if isinstance(private_key, RSAPrivateKey):
+        return private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+    raise KalshiAPIError(
+        f"Unsupported private key type {type(private_key).__name__}. "
+        "Kalshi accepts RSA and Ed25519."
+    )
 
 
 class KalshiAPIError(Exception):
@@ -107,37 +130,27 @@ class KalshiClient(TradingLoggerMixin):
             raise KalshiAPIError(f"Failed to load private key: {e}")
     
     def _sign_request(self, timestamp: str, method: str, path: str) -> str:
+        """Sign ``timestamp + METHOD + path`` and return base64.
+
+        Kalshi accepts both key types and picks verification from the
+        registered public key. Ed25519 signs the message bytes directly.
+        RSA uses RSA-PSS with SHA-256, MGF1-SHA256, and a digest-length salt.
+        The path must not include the query string. Headers stay
+        ``KALSHI-ACCESS-KEY``, ``KALSHI-ACCESS-TIMESTAMP``, and
+        ``KALSHI-ACCESS-SIGNATURE``.
         """
-        Sign request using RSA PSS signing method as per Kalshi API docs.
-        
-        Args:
-            timestamp: Request timestamp in milliseconds
-            method: HTTP method
-            path: Request path
-        
-        Returns:
-            Base64 encoded signature
-        """
-        # Create message to sign: timestamp + method + path
-        message = timestamp + method.upper() + path
-        message_bytes = message.encode('utf-8')
-        
+        path_without_query = path.split("?", 1)[0]
+        message = f"{timestamp}{method.upper()}{path_without_query}".encode("utf-8")
         try:
-            # Sign using RSA PSS as per Kalshi documentation
-            signature = self.private_key.sign(
-                message_bytes,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.DIGEST_LENGTH
-                ),
-                hashes.SHA256()
-            )
-            
-            return base64.b64encode(signature).decode('utf-8')
+            signature = sign_kalshi_message(self.private_key, message)
+            return base64.b64encode(signature).decode("utf-8")
         except Exception as e:
-            self.logger.error("Failed to sign request", error=str(e))
-            raise KalshiAPIError(f"Failed to sign request: {e}")
-    
+            self.logger.error("Failed to sign request", error=type(e).__name__)
+            detail = str(e).replace("\n", " ")
+            if "PRIVATE KEY" in detail or "-----BEGIN" in detail:
+                detail = type(e).__name__
+            raise KalshiAPIError(f"Failed to sign request: {detail}") from None
+
     @staticmethod
     def _is_order_create(method: str, endpoint: str) -> bool:
         """True for Create Order (V2). Cancels and amends are not creates."""

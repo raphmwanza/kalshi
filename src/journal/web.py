@@ -78,6 +78,21 @@ async def _load_events() -> list:
         await journal.close()
 
 
+def public_probe_error(exc: BaseException) -> str:
+    """Error text safe to show on the Accounts page. No key material."""
+    text = str(exc).replace("\r", " ").replace("\n", " ").strip()
+    if "-----BEGIN" in text or "-----END" in text or "PRIVATE KEY" in text:
+        text = type(exc).__name__
+    if len(text) > 300:
+        text = text[:300] + "…"
+    if not text:
+        text = type(exc).__name__
+    code = getattr(exc, "status_code", None)
+    if code is not None and str(code) not in text:
+        return f"Connection failed: {type(exc).__name__} {code}: {text}"
+    return f"Connection failed: {text}"
+
+
 async def probe_balance(api_key_id: str, pem: str) -> str:
     """Read-only balance check. The result text never includes the key."""
     from src.clients.kalshi_client import KalshiClient
@@ -86,10 +101,8 @@ async def probe_balance(api_key_id: str, pem: str) -> str:
     try:
         payload = await client.get_balance()
     except Exception as exc:
-        code = getattr(exc, "status_code", None)
-        label = type(exc).__name__ if code is None else f"{type(exc).__name__} {code}"
-        logger.info("Kalshi balance check failed (%s)", label)
-        return f"Connection failed ({label})."
+        logger.info("Kalshi balance check failed (%s)", type(exc).__name__)
+        return public_probe_error(exc)
     finally:
         await client.close()
     raw = payload.get("balance") if isinstance(payload, dict) else None
@@ -362,9 +375,9 @@ def create_app(
             response = await _accounts_response(session, unavailable=str(exc), status_code=503)
         except AccountStoreError as exc:
             message = str(exc)
-        except Exception:
+        except Exception as exc:
             logger.info("Kalshi balance check failed for account %s", account_id)
-            message = "Connection failed."
+            message = public_probe_error(exc)
         finally:
             if close_store and store is not None:
                 await store.close()

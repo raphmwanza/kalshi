@@ -146,6 +146,23 @@ def account_is_live(account: KalshiAccount, process_live: bool) -> bool:
     return bool(account.live)
 
 
+def env_has_explicit_api_key() -> bool:
+    """True when an API key id was actually set, not merely a default key path."""
+    if os.environ.get("KALSHI_ACCOUNTS", "").strip():
+        return True
+    if os.environ.get("KALSHI_API_KEY", "").strip():
+        return True
+    index = 1
+    while index <= 50:
+        if (
+            os.environ.get(f"KALSHI_API_KEY_ID_{index}", "").strip()
+            or os.environ.get(f"KALSHI_API_KEY_{index}", "").strip()
+        ):
+            return True
+        index += 1
+    return False
+
+
 def is_unconfigured_default(account: KalshiAccount) -> bool:
     """True for the placeholder returned when no account env vars are set."""
     return (
