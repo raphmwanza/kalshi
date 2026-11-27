@@ -227,7 +227,7 @@ def _run_tennis(
         pass
 
     print("🎾 TENNIS SET-3 MODE")
-    print("   Back the set-3 favorite (75–90% implied, cash out 99c) | tiered sizing (cap $5k)")
+    print("   Back the set-3 favorite (75–90% implied, cash out 94c) | tiered sizing (cap $5k)")
     print("   Live set/match state via SofaScore.")
     if not live_mode:
         print("   DRY RUN — no real orders will be placed")
@@ -898,7 +898,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tennis",
         action="store_true",
         dest="tennis",
-        help="Tennis Set-3: back the set-3 favorite (75-90%% implied, cash out 99c) via SofaScore, tiered sizing",
+        help="Tennis Set-3: back the set-3 favorite (75-90%% implied, cash out 94c) via SofaScore, tiered sizing",
     )
     p_run.add_argument(
         "--loop",

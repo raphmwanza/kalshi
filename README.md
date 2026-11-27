@@ -114,6 +114,8 @@ Set these on the service:
 
 Live set scores come from SofaScore (Chrome TLS impersonation, with `Origin` and `Referer` of `https://www.sofascore.com`). Set `SOFASCORE_PROXY_URL` when Railway's IP is challenged. If SofaScore fails, the cycle uses ESPN's public ATP and WTA scoreboards. If both fail, the cycle logs that and does not open new trades from a missing or leftover score list.
 
+Each cycle reads those scores first. Kalshi is used to buy and to cash out. If nothing is actionable and the account has no open tennis position or resting order, the cycle makes no Kalshi calls (`scores only, no Kalshi calls`). Positions and resting orders are cached and refreshed at startup, after an order, and every `KALSHI_SYNC_SECONDS` (default 60). While a position is open, only that market's bid is polled for the 35c stop. The cash-out line rests on Kalshi at 94c (`SELL_ALL_AT`); a leftover 99c line is cancelled and replaced on the next sync. Balance and the daily win rate are read on that same slow timer, not every `BOT_INTERVAL`.
+
 ### Several accounts
 
 One deployment can run the tennis strategy on more than one Kalshi account. Each account has its own client, bankroll, position cap, and journal tag. SofaScore is fetched once per cycle and shared. If one account errors, the others still run.
