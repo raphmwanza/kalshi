@@ -28,20 +28,12 @@ class _Response:
 
 
 class _Session:
-    def __init__(self, responses, flashscore_body=None, flashscore_status=404):
+    def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
-        self.flashscore_body = flashscore_body
-        self.flashscore_status = flashscore_status
 
     async def get(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        if "flashscore" in url:
-            if self.flashscore_body is None and self.flashscore_status != 200:
-                return _Response(self.flashscore_status, {})
-            response = _Response(self.flashscore_status, {})
-            response.text = self.flashscore_body or ""
-            return response
         if not self._responses:
             raise RuntimeError("no scripted response")
         item = self._responses.pop(0)
@@ -133,51 +125,6 @@ def _espn_live():
     }
 
 
-def test_flashscore_feed_parses_live_singles_and_skips_the_rest():
-    from pathlib import Path
-
-    from src.clients.flashscore_tennis import matches_from_flashscore_feed
-    from src.clients.sofascore_client import classify_round_label
-
-    raw = Path("tests/fixtures/flashscore_live_sample.txt").read_text(encoding="utf-8")
-    matches = matches_from_flashscore_feed(raw)
-    names = [(m.home_name, m.away_name, m.current_set) for m in matches]
-    assert ("Sureshkumar M.", "Sasikumar M.", 1) in names
-    assert ("Langmo C.", "Dellavedova M.", 3) in names
-    assert all("/" not in m.home_name and "/" not in m.away_name for m in matches)
-    assert all(m.status_type == "inprogress" for m in matches)
-    live = next(m for m in matches if m.home_name == "Sureshkumar M.")
-    assert live.home_score["period1"] == 5
-    assert live.away_score["period1"] == 5
-    assert live.home_sets_won == 0
-    assert live.is_live is True
-    late = next(m for m in matches if m.home_name == "Langmo C.")
-    assert late.home_score == {"period1": 6, "period2": 4, "period3": 4}
-    assert late.away_score["period3"] == 2
-    assert late.leading_set_by("Langmo C.", 3, 2) is True
-    assert classify_round_label(late.round_name) == "semifinal"
-    assert "Sweeny" not in {m.home_name for m in matches}
-    assert matches_from_flashscore_feed("") == []
-
-
-@pytest.mark.asyncio
-async def test_flashscore_success_is_used_before_sofascore(caplog):
-    from pathlib import Path
-
-    reset_sofascore_backoff()
-    caplog.set_level(logging.INFO)
-    raw = Path("tests/fixtures/flashscore_live_sample.txt").read_text(encoding="utf-8")
-    session = _Session([], flashscore_body=raw, flashscore_status=200)
-    client = SofaScoreClient(session=session)
-    matches = await client.get_live_tennis_matches()
-    assert client.score_source == "flashscore"
-    assert client.last_fetch_blocked is False
-    assert any(m.home_name == "Sureshkumar M." for m in matches)
-    assert all("sofascore" not in url for url, _ in session.calls)
-    assert session.calls[0][1]["headers"]["x-fsign"] == "SW9D1eZo"
-    assert "scores: Flashscore" in caplog.text
-
-
 def test_espn_parser_keeps_only_in_progress_singles():
     matches = matches_from_espn_scoreboard(_espn_live())
     assert len(matches) == 1
@@ -206,9 +153,8 @@ async def test_sofascore_success_does_not_call_espn():
     assert client.score_source == "sofascore"
     assert len(matches) == 1
     assert matches[0].home_name == "Alcaraz C."
-    sofascore_calls = [(url, kwargs) for url, kwargs in session.calls if "sofascore.com" in url or "sofascore.app" in url]
-    assert len(sofascore_calls) == 1
-    url, kwargs = sofascore_calls[0]
+    assert len(session.calls) == 1
+    url, kwargs = session.calls[0]
     assert "sofascore" in url
     assert kwargs["impersonate"] == "chrome152"
     assert kwargs["headers"]["Origin"] == "https://www.sofascore.com"
@@ -284,7 +230,7 @@ async def test_both_score_sources_fail_blocks_entries(caplog):
     assert matches == []
     assert client.last_fetch_blocked is True
     assert client.score_source == ""
-    assert "Flashscore, SofaScore, and ESPN failed" in caplog.text
+    assert "both failed" in caplog.text
     assert "secret" not in caplog.text
     assert entry_matches(
         [matches_from_espn_scoreboard(_espn_live())[0]],
